@@ -1,0 +1,16 @@
+
+Self-healing: 18 trials
+
+fault       expected    correct  mean heal s  mean mttr s  actions taken
+fw-vxlan    healed         3/3          33.6          7.3  on user2: iptables -D INPUT
+none        healthy        3/3           7.1            -  (none)
+route       healed         3/3          32.5          7.3  on user1: ip route replace 10.42.1.0/24 via 10.42.1.0 dev flannel.1 onlink
+delay       healed         3/3          26.2          7.3  on user2: tc qdisc del dev flannel.1 root
+mtu         healed         3/3          59.9         22.9  on user1: iptables -t mangle -I FORWARD -o flannel.1
+loss        healed         3/3          28.2          7.3  on user2: tc qdisc del dev flannel.1 root
+
+overall correct: 18/18 = 100.0%
+healed (set-1 faults): 15/15
+wrongly touched (netpol/none with an action): 0
+rollbacks: 0
+time to recover after the fix: mean 10.4 s, max 23.0 s

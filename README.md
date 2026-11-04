@@ -353,6 +353,13 @@ python3 eval/run_set1.py --set 2 --rounds 3   # score detection
 python3 eval/run_heal.py --set 2 --rounds 3   # score healing
 ```
 
+### Results on the Pi cluster (5 faults + healthy × 3 rounds, random order)
+
+| Run | Result | Time |
+|---|---|---|
+| [detection](eval/results/set2-20261105-030339/report.txt) | **18/18 = 100%** | mean 14.1 s per diagnosis |
+| [healing](eval/results/heal-set2-20261105-031405/report.txt) | **18/18 = 100%**: 15/15 faults healed, 3/3 healthy runs untouched, 0 rollbacks | fix → app OK: mean 10.4 s (7.3 s for rule/route fixes, 23 s for the MSS clamp) |
+
 **Findings from the real cluster:**
 - **Flannel does not restore a deleted route by itself.** It was still missing after 45 s, so this is a failure Kubernetes doesn't heal.
 - **On k3s, the underlay vs overlay comparison is what separates the causes.** During the loss fault, node → node stayed at 0% while pod → pod lost 30%.

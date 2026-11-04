@@ -141,7 +141,7 @@ def report(trials, outdir):
     correct = sum(t["correct"] for t in trials)
     healable = [t for t in trials if t["expected"] == "healed"]
     lines += [f"\noverall correct: {correct}/{len(trials)} = {100 * correct / len(trials):.1f}%",
-              f"healed (set-1 faults): {sum(t['correct'] for t in healable)}/{len(healable)}",
+              f"healed (injected faults): {sum(t['correct'] for t in healable)}/{len(healable)}",
               f"wrongly touched (netpol/none with an action): "
               f"{sum(1 for t in trials if t['expected'] != 'healed' and t['actions'])}",
               f"rollbacks: {sum(t['rolled_back'] for t in trials)}"]
