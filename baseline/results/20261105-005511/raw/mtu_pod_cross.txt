@@ -1,0 +1,13 @@
+path MTU search to 10.42.1.11: (payload size, passed)
+500	True
+986	True
+1229	True
+1351	True
+1412	True
+1442	False
+1427	False
+1419	True
+1423	False
+1421	True
+1422	True
+result: 1450

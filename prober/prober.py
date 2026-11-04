@@ -30,11 +30,12 @@ ERROR_HINTS = [
     ("could not translate host name", "dns"),
     ("name or service not known", "dns"),
     ("temporary failure in name resolution", "dns"),
-    ("connection refused", "refused"),          # reached a node, nothing listening: targetPort / no endpoints
+    ("connection refused", "refused"),          # nothing listening (targetPort / no endpoints), or a REJECT
+                                                # rule: on k3s, NetworkPolicy denials (kube-router) look like this
     ("actively refused", "refused"),            # Windows wording, if the prober runs on a laptop
     ("no route to host", "no_route"),           # no endpoints (kube-proxy REJECT) or broken routing
     ("network is unreachable", "no_route"),
-    ("timeout expired", "timeout"),             # packets lost: firewall, MTU, NetworkPolicy, overlay, loss
+    ("timeout expired", "timeout"),             # packets silently dropped: firewall DROP, MTU, overlay, loss
     ("timed out", "timeout"),
     ("password authentication failed", "db_auth"),
     ("does not exist", "db_schema"),

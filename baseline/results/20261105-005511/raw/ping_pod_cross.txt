@@ -1,0 +1,27 @@
+$ ping -c 20 -i 0.2 -W 2 10.42.1.11
+[exit 0]
+PING 10.42.1.11 (10.42.1.11) 56(84) bytes of data.
+64 bytes from 10.42.1.11: icmp_seq=1 ttl=62 time=8.17 ms
+64 bytes from 10.42.1.11: icmp_seq=2 ttl=62 time=13.5 ms
+64 bytes from 10.42.1.11: icmp_seq=3 ttl=62 time=9.48 ms
+64 bytes from 10.42.1.11: icmp_seq=4 ttl=62 time=10.8 ms
+64 bytes from 10.42.1.11: icmp_seq=5 ttl=62 time=9.68 ms
+64 bytes from 10.42.1.11: icmp_seq=6 ttl=62 time=10.6 ms
+64 bytes from 10.42.1.11: icmp_seq=7 ttl=62 time=12.6 ms
+64 bytes from 10.42.1.11: icmp_seq=8 ttl=62 time=24.8 ms
+64 bytes from 10.42.1.11: icmp_seq=9 ttl=62 time=9.46 ms
+64 bytes from 10.42.1.11: icmp_seq=10 ttl=62 time=12.8 ms
+64 bytes from 10.42.1.11: icmp_seq=11 ttl=62 time=10.3 ms
+64 bytes from 10.42.1.11: icmp_seq=12 ttl=62 time=11.3 ms
+64 bytes from 10.42.1.11: icmp_seq=13 ttl=62 time=11.1 ms
+64 bytes from 10.42.1.11: icmp_seq=14 ttl=62 time=10.4 ms
+64 bytes from 10.42.1.11: icmp_seq=15 ttl=62 time=11.3 ms
+64 bytes from 10.42.1.11: icmp_seq=16 ttl=62 time=16.4 ms
+64 bytes from 10.42.1.11: icmp_seq=17 ttl=62 time=23.4 ms
+64 bytes from 10.42.1.11: icmp_seq=18 ttl=62 time=15.0 ms
+64 bytes from 10.42.1.11: icmp_seq=19 ttl=62 time=9.37 ms
+64 bytes from 10.42.1.11: icmp_seq=20 ttl=62 time=13.4 ms
+
+--- 10.42.1.11 ping statistics ---
+20 packets transmitted, 20 received, 0% packet loss, time 3813ms
+rtt min/avg/max/mdev = 8.165/12.687/24.830/4.300 ms

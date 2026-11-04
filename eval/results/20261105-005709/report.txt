@@ -1,0 +1,29 @@
+
+Confusion matrix (rows = expected, columns = predicted), 24 trials
+
+                        healthy dns_coredn wrong_serv selector_m no_ready_e port_misma      other
+healthy                       3          .          .          .          .          .          .
+dns_coredns_down              .          3          .          .          .          .          .
+wrong_service_name            .          .          3          .          .          .          .
+selector_mismatch             .          .          .          3          .          .          .
+no_ready_endpoints            .          .          .          .          6          .          .
+port_mismatch                 .          .          .          .          .          3          .
+other                         .          .          .          .          .          3          .
+
+accuracy: 21/24 = 87.5%
+diagnosis time: mean 1.8 s, max 2.2 s
+
+per fault:
+  readiness    3/3
+  coredns      3/3
+  selector     3/3
+  wrong-name   3/3
+  netpol       0/3
+  none         3/3
+  port         3/3
+  scale0       3/3
+
+misses:
+  round 1 netpol: got port_mismatch - Service db-service forwards to port 5432, but nothing listens there on the pod
+  round 2 netpol: got port_mismatch - Service db-service forwards to port 5432, but nothing listens there on the pod
+  round 3 netpol: got port_mismatch - Service db-service forwards to port 5432, but nothing listens there on the pod

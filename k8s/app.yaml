@@ -30,6 +30,11 @@ metadata:
   name: database
 spec:
   replicas: 1
+  # Recreate: one Postgres, no shared volume, so never run two at once. It also
+  # makes the readiness fault real: with RollingUpdate the old Ready pod would
+  # keep serving and the Service would never lose its endpoint.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: database
@@ -115,6 +120,12 @@ spec:
             - secretRef:
                 name: postgres-secret
           env:
+            # Explicit (not just the app's default) so the agent can read where
+            # the backend thinks the DB is, and so `kubectl apply` resets it.
+            - name: DB_HOST
+              value: db-service
+            - name: DB_PORT
+              value: "5432"
             - name: NODE_NAME
               valueFrom:
                 fieldRef:

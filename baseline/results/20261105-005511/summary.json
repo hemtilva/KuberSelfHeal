@@ -1,0 +1,141 @@
+{
+  "collected_at": "2026-11-05T00:55:12+0530",
+  "src_node": "user1",
+  "dst_node": "user2",
+  "nodes": {
+    "master": {
+      "ip": "10.206.185.218",
+      "ready": true,
+      "role": null,
+      "pod_cidr": "10.42.0.0/24"
+    },
+    "user1": {
+      "ip": "10.206.185.184",
+      "ready": true,
+      "role": "backend",
+      "pod_cidr": "10.42.2.0/24"
+    },
+    "user2": {
+      "ip": "10.206.185.245",
+      "ready": true,
+      "role": "database",
+      "pod_cidr": "10.42.1.0/24"
+    }
+  },
+  "node_facts": {
+    "master": {
+      "mtu": {
+        "eth0": 1500,
+        "wlan0": 1500,
+        "flannel.1": 1450,
+        "cni0": 1450
+      },
+      "node_iface": "wlan0",
+      "node_network": "10.206.185.0/24",
+      "vxlan_port": 8472,
+      "vxlan_local_ip": "10.206.185.218",
+      "vxlan_dev": "wlan0",
+      "wifi": {
+        "iface": "wlan0",
+        "link_quality": 65.0,
+        "signal_dbm": -45.0
+      },
+      "conntrack_count": 187,
+      "conntrack_max": 131072
+    },
+    "user1": {
+      "mtu": {
+        "eth0": 1500,
+        "wlan0": 1500,
+        "flannel.1": 1450,
+        "cni0": 1450
+      },
+      "node_iface": "wlan0",
+      "node_network": "10.206.185.0/24",
+      "vxlan_port": 8472,
+      "vxlan_local_ip": "10.206.185.184",
+      "vxlan_dev": "wlan0",
+      "wifi": {
+        "iface": "wlan0",
+        "link_quality": 63.0,
+        "signal_dbm": -47.0
+      },
+      "conntrack_count": 74,
+      "conntrack_max": 131072
+    },
+    "user2": {
+      "mtu": {
+        "eth0": 1500,
+        "wlan0": 1500,
+        "flannel.1": 1450,
+        "cni0": 1450
+      },
+      "node_iface": "wlan0",
+      "node_network": "10.206.185.0/24",
+      "vxlan_port": 8472,
+      "vxlan_local_ip": "10.206.185.245",
+      "vxlan_dev": "wlan0",
+      "wifi": {
+        "iface": "wlan0",
+        "link_quality": 61.0,
+        "signal_dbm": -49.0
+      },
+      "conntrack_count": 29,
+      "conntrack_max": 131072
+    }
+  },
+  "tests": {
+    "node_to_node": {
+      "loss_pct": 0.0,
+      "rtt_min_ms": 6.651,
+      "rtt_avg_ms": 10.201,
+      "rtt_max_ms": 13.788,
+      "rtt_mdev_ms": 1.73,
+      "path_mtu": 1500,
+      "mbps": 14.9,
+      "retransmits": 0
+    },
+    "pod_to_pod_cross": {
+      "loss_pct": 0.0,
+      "rtt_min_ms": 8.165,
+      "rtt_avg_ms": 12.687,
+      "rtt_max_ms": 24.83,
+      "rtt_mdev_ms": 4.3,
+      "path_mtu": 1450,
+      "mbps": 13.2,
+      "retransmits": 0
+    },
+    "pod_to_pod_same": {
+      "loss_pct": 0.0,
+      "rtt_min_ms": 0.044,
+      "rtt_avg_ms": 0.064,
+      "rtt_max_ms": 0.159,
+      "rtt_mdev_ms": 0.023
+    },
+    "pod_to_db_pod": {
+      "loss_pct": 0.0,
+      "rtt_min_ms": 8.279,
+      "rtt_avg_ms": 11.263,
+      "rtt_max_ms": 14.771,
+      "rtt_mdev_ms": 1.625
+    },
+    "dns": {
+      "queries": 20,
+      "ok": 20,
+      "avg_ms": 5.4,
+      "p95_ms": 7,
+      "max_ms": 11
+    },
+    "app": {
+      "url": "http://10.206.185.184:30080/",
+      "probes": 60,
+      "ok": 60,
+      "p50_ms": 95.3,
+      "p95_ms": 118.0,
+      "p99_ms": 161.9,
+      "max_ms": 161.9,
+      "failure_hints": []
+    }
+  },
+  "warnings": []
+}

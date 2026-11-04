@@ -1,0 +1,42 @@
+$ for i in $(seq 20); do dig +tries=1 +time=2 db-service.default.svc.cluster.local | grep -E 'Query time|status:|timed out'; done
+[exit 0]
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 28045
+;; Query time: 11 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 55141
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 24925
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 38595
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 20730
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 4502
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 37238
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 6494
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 52934
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 5060
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 61177
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 38528
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 38049
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 15106
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 38572
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 13591
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 46870
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 7468
+;; Query time: 3 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 35353
+;; Query time: 7 msec
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 47654
+;; Query time: 7 msec
