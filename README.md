@@ -272,6 +272,45 @@ Baseline for the same cluster: [baseline/results/](baseline/results/).
 Node to node: 10.2 ms, MTU 1500, 14.9 Mbit/s. Pod to pod across nodes: 12.7 ms,
 MTU 1450, 13.2 Mbit/s. Pod to pod on the same node: 0.06 ms.
 
+## 6. Self-healing (set 1)
+
+Kubernetes heals *drift*: it restarts a crashed pod or recreates a deleted one.
+It does **not** fix a wrong configuration. It faithfully runs 0 database replicas
+or sends traffic to port 5433 because that's what it was told. `agent/heal.py`
+closes that gap:
+
+```
+diagnose ──► safe, unambiguous fix? ──no──► escalate to a human (with the evidence)
+                 │ yes
+                 ▼
+              apply ──► verify: does the app really answer (HTTP 200)? ──yes──► healed
+                                     │ no, same fault after the timeout
+                                     ▼
+                               undo the change ──► failed (escalate)
+```
+
+| Fault | Fix applied automatically |
+|---|---|
+| CoreDNS scaled to 0 (14) | `scale deploy/coredns --replicas=1` |
+| wrong `DB_HOST` (12) | `set env DB_HOST=<the one similar Service that exposes the port>` |
+| selector typo (7) | patch the selector to the clearly closest pod labels (never the client's own) |
+| DB scaled to 0 (8) | scale back to the replica count last applied |
+| readiness failing after a change (8) | `rollout undo --to-revision=<previous>`, only if the current revision **never** became ready |
+| wrong `targetPort` (9) | patch it to the port the pod is actually listening on |
+| NetworkPolicy / anything `other` | **never touched.** It may be intentional security, so it's escalated |
+
+Safety rules: act only on a `high`-confidence set-1 diagnosis with an
+unambiguous fix; one change at a time; "fixed" means the app answers again,
+not that `kubectl` succeeded; undo the change if the fault persists; give
+young pods a grace period before rolling back. Every run is appended to
+`heal_log.jsonl`.
+
+```bash
+python3 agent/heal.py --dry-run     # show the plan only
+python3 agent/heal.py               # heal for real
+python3 eval/run_heal.py --rounds 3 # score it: heal success, time to recover
+```
+
 ## Design notes
 
 - **The backend's probes check only the process (`/healthz`), not the DB.** If

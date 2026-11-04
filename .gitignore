@@ -12,3 +12,6 @@ probes*.jsonl
 # eval runs started with nohup on the Pi
 eval_run*.log
 *.pid
+
+# self-heal audit trail (written on the Pi)
+heal_log.jsonl

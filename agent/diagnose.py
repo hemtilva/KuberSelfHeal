@@ -28,6 +28,7 @@ agent falls back to configuration checks only.
 """
 
 import argparse
+import datetime
 import difflib
 import ipaddress
 import json
@@ -75,6 +76,15 @@ class Kube:
         return self.run("-n", ns, "exec", pod, "--", "sh", "-c", cmd, timeout=timeout)
 
 
+def pod_age_s(pod):
+    """Seconds since the pod started (0 if unknown)."""
+    start = pod.get("status", {}).get("startTime")
+    if not start:
+        return 0.0
+    started = datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
+    return (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
+
+
 def matches(selector, labels):
     return all(labels.get(k) == v for k, v in selector.items())
 
@@ -106,6 +116,8 @@ class Diagnoser:
         self.active = active
         self.diag_pod = None
         self.findings, self.checks = [], []
+        self.client_labels = {}   # pod labels of the client (never point a Service at it)
+        self.client_port = None
         self.other_evidence = []  # clues for the "other" label (e.g. NetworkPolicies on the DB pod)
 
     # --- bookkeeping ---
@@ -113,9 +125,22 @@ class Diagnoser:
     def check(self, name, ok, detail):
         self.checks.append({"check": name, "ok": ok, "detail": detail})
 
-    def find(self, label, confidence, summary, evidence, fix):
+    def find(self, label, confidence, summary, evidence, fix, action=None):
+        """Record a finding. `action` is a machine-readable fix for agent/heal.py
+        (None = no safe automatic fix; a human has to decide)."""
         self.findings.append({"label": label, "problem": LABELS[label], "confidence": confidence,
-                              "summary": summary, "evidence": evidence, "fix": fix})
+                              "summary": summary, "evidence": evidence, "fix": fix, "action": action})
+
+    def owner_deployment(self, pod):
+        """Deployment that owns a pod (pod -> ReplicaSet -> Deployment), or None."""
+        ns = pod["metadata"].get("namespace", self.ns)
+        rs_ref = next((o for o in pod["metadata"].get("ownerReferences", []) if o["kind"] == "ReplicaSet"), None)
+        if not rs_ref:
+            return None
+        rs = self.k.get("-n", ns, "get", "replicaset", rs_ref["name"])
+        dep_ref = next((o for o in (rs or {}).get("metadata", {}).get("ownerReferences", [])
+                        if o["kind"] == "Deployment"), None)
+        return self.k.get("-n", ns, "get", "deploy", dep_ref["name"]) if dep_ref else None
 
     # --- active tests, run from the diag-pod on the backend's node ---
 
@@ -191,12 +216,17 @@ class Diagnoser:
                                        "-l", "kubernetes.io/service-name=kube-dns")
                for e in s.get("endpoints") or [] if e.get("conditions", {}).get("ready") is not False]
         if ready == 0 or not eps:
+            if desired == 0:
+                action = {"type": "scale", "ns": "kube-system", "kind": "deploy", "name": "coredns",
+                          "replicas": 1, "previous": 0}
+                fix = "kubectl -n kube-system scale deploy/coredns --replicas=1"
+            else:  # pods exist but aren't ready: restarting them is the safe first step
+                action = {"type": "restart", "ns": "kube-system", "name": "coredns"}
+                fix = "kubectl -n kube-system rollout restart deploy/coredns"
             self.find("dns_coredns_down", "high",
                       "CoreDNS is down, so no Service name in the cluster can be resolved",
                       [f"coredns Deployment: {ready}/{desired} ready replicas",
-                       f"kube-dns Service: {len(eps)} ready endpoints"],
-                      "kubectl -n kube-system scale deploy/coredns --replicas=1 "
-                      "(if replicas>0, check: kubectl -n kube-system describe pod -l k8s-app=kube-dns)")
+                       f"kube-dns Service: {len(eps)} ready endpoints"], fix, action)
         else:
             self.check("coredns", True, f"{ready}/{desired} ready, {len(eps)} kube-dns endpoints")
 
@@ -211,14 +241,29 @@ class Diagnoser:
         same_name = [f"{n}.{s}" for n, s in all_svcs if n == name]
         if same_name:
             evidence.append(f"a Service with that name exists in another namespace: {', '.join(same_name)}")
-        close = difflib.get_close_matches(name, sorted({n for n, s in all_svcs if s == ns}), n=3, cutoff=0.5)
+        # Candidates: same namespace, never the client's own Service, never the API server.
+        candidates = sorted({n for n, s in all_svcs if s == ns and n not in (self.client_service, "kubernetes")})
+        close = difflib.get_close_matches(name, candidates, n=3, cutoff=0.5)
         if close:
             evidence.append(f"similar Services in '{ns}': {', '.join(close)}")
         suggestion = same_name[0] if same_name else (close[0] if close else None)
+        # Auto-fix only for exactly one close match in the same namespace that actually
+        # exposes the port the client uses. A same-named Service in another namespace
+        # would be a cross-environment change: report it, never apply it.
+        unique = not same_name and len(close) == 1
+        if unique:
+            cand = self.k.get("-n", ns, "get", "svc", close[0]) or {}
+            if self.client_port not in [p.get("port") for p in cand.get("spec", {}).get("ports", [])]:
+                unique = False
+                evidence.append(f"Service {close[0]} does not expose port {self.client_port}")
+        action = ({"type": "set_env", "ns": self.ns, "name": self.client_deploy, "env": "DB_HOST",
+                   "value": suggestion, "previous": host} if suggestion and unique else None)
+        if suggestion and not unique:
+            evidence.append("ambiguous, cross-namespace or port-incompatible candidate: not fixing automatically")
         self.find("wrong_service_name", "high",
                   f"DB_HOST points to a Service that doesn't exist ({host})", evidence,
                   f"kubectl -n {self.ns} set env deploy/{self.client_deploy} DB_HOST={suggestion}"
-                  if suggestion else "fix DB_HOST in the backend Deployment")
+                  if suggestion else "fix DB_HOST in the backend Deployment", action)
         return None
 
     def check_selector(self, svc):
@@ -243,13 +288,23 @@ class Diagnoser:
                 if matches(selector, tmpl):
                     replicas = w["spec"].get("replicas", 1)
                     wname = w["metadata"]["name"]
+                    # Restore the replica count the operator last applied (kubectl apply
+                    # records it); fall back to 1.
+                    try:
+                        applied = json.loads(w["metadata"].get("annotations", {}).get(
+                            "kubectl.kubernetes.io/last-applied-configuration", "{}"))
+                        want = int(applied.get("spec", {}).get("replicas", 1)) or 1
+                    except (ValueError, TypeError):
+                        want = 1
+                    action = ({"type": "scale", "ns": ns, "kind": kind, "name": wname,
+                               "replicas": want, "previous": 0} if replicas == 0 else None)
                     self.find("no_ready_endpoints", "high" if replicas == 0 else "medium",
                               f"Service {name} has no backing pods: {kind}/{wname} "
                               + ("is scaled to 0" if replicas == 0 else "has no pods yet"),
                               [f"selector {sel_txt} matches the pod template of {kind}/{wname}",
                                f"{kind}/{wname}: spec.replicas={replicas}, matching pods=0"],
-                              f"kubectl -n {ns} scale {kind}/{wname} --replicas=1" if replicas == 0
-                              else f"kubectl -n {ns} describe {kind}/{wname}")
+                              f"kubectl -n {ns} scale {kind}/{wname} --replicas={want}" if replicas == 0
+                              else f"kubectl -n {ns} describe {kind}/{wname}", action)
                     return None
 
         evidence = [f"Service {name} selector {sel_txt} matches 0 of {len(pods)} pods in '{ns}'"]
@@ -268,8 +323,15 @@ class Diagnoser:
         fix = (f"kubectl -n {ns} patch svc {name} --type=merge -p "
                f"'{json.dumps({'spec': {'selector': near[0][2]}})}'"
                if near else f"set the selector of Service {name} to the labels of the intended pods")
+        # Auto-fix only with a clear winner: the best near miss must beat the runner-up,
+        # and must not be the client itself (the Service would then point at the backend).
+        client_labels = self.client_labels or {}
+        clear = (near and (len(near) == 1 or near[0][0] > near[1][0])
+                 and not matches(near[0][2], client_labels))
+        action = ({"type": "patch_selector", "ns": ns, "svc": name, "selector": near[0][2],
+                   "previous": selector} if clear else None)
         self.find("selector_mismatch", "high" if near else "medium",
-                  f"Service {name}'s selector matches no pods", evidence, fix)
+                  f"Service {name}'s selector matches no pods", evidence, fix, action)
         return None
 
     def check_endpoints(self, svc, selected):
@@ -294,10 +356,38 @@ class Diagnoser:
             msgs = [e.get("message", "").strip() for e in events if e.get("reason") in ("Unhealthy", "BackOff", "Failed")]
             for m in msgs[-2:]:
                 evidence.append(f"event on {pname}: {m[:160]}")
+
+        # Healing: if the owning Deployment has an earlier revision, the most likely
+        # cause is a recent bad change -> roll back. heal.py waits first if the pods
+        # are young (they may simply still be starting).
+        action, fix = None, (f"kubectl -n {ns} describe pod {selected[0]['metadata']['name']} "
+                             "(check the readinessProbe and the container logs)")
+        dep = self.owner_deployment(selected[0])
+        if dep:
+            dname = dep["metadata"]["name"]
+            rev = int(dep["metadata"].get("annotations", {}).get("deployment.kubernetes.io/revision", "1"))
+            ages = [pod_age_s(p) for p in selected]
+            # Roll back only if the CURRENT revision never finished rolling out: then a recent
+            # change is the likely cause. If it once served fine (NewReplicaSetAvailable), the
+            # problem is something else and rolling back could restore an older bad template.
+            prog = next((c for c in dep.get("status", {}).get("conditions", []) if c.get("type") == "Progressing"), {})
+            rollout_done = prog.get("reason") == "NewReplicaSetAvailable"
+            dsel = ",".join(f"{k}={v}" for k, v in dep["spec"]["selector"].get("matchLabels", {}).items())
+            revs = {int(rs["metadata"].get("annotations", {}).get("deployment.kubernetes.io/revision", "0"))
+                    for rs in self.k.items("-n", ns, "get", "replicaset", "-l", dsel)
+                    if any(o.get("kind") == "Deployment" and o.get("name") == dname
+                           for o in rs["metadata"].get("ownerReferences", []))}
+            prev = max((r for r in revs if r < rev), default=None)
+            evidence.append(f"deploy/{dname} is at revision {rev}, rollout "
+                            + ("completed earlier" if rollout_done else f"not completed ({prog.get('reason')})")
+                            + f"; youngest pod is {min(ages):.0f} s old")
+            if prev and not rollout_done:
+                action = {"type": "rollout_undo", "ns": ns, "name": dname, "revision": rev,
+                          "to_revision": prev, "pod_age_s": min(ages)}
+                fix = f"kubectl -n {ns} rollout undo deploy/{dname} --to-revision={prev}  (revision {rev} never became ready)"
         self.find("no_ready_endpoints", "high",
                   f"pods behind {name} exist but none are Ready, so the Service has no endpoints",
-                  evidence, f"kubectl -n {ns} describe pod {selected[0]['metadata']['name']} "
-                            "(check the readinessProbe and the container logs)")
+                  evidence, fix, action)
         return None
 
     def check_ports(self, svc, ready_pods, client_port):
@@ -350,7 +440,9 @@ class Diagnoser:
                       f"Service {name} forwards to port {tp}, but nothing listens there on the pod",
                       evidence, f"kubectl -n {ns} patch svc {name} --type=json -p '"
                                 + json.dumps([{"op": "replace", "path": f"/spec/ports/{ports.index(sp)}/targetPort",
-                                               "value": fix_port}]) + "'")
+                                               "value": fix_port}]) + "'",
+                      {"type": "patch_target_port", "ns": ns, "svc": name, "index": ports.index(sp),
+                       "value": fix_port, "previous": tp})
         elif state != "open" and wrong_port:
             self.find("port_mismatch", "medium",
                       f"Service {name} targetPort {tp} is not a port the pod declares "
@@ -376,9 +468,11 @@ class Diagnoser:
         env = {e["name"]: e.get("value") for c in client["spec"]["template"]["spec"]["containers"]
                for e in c.get("env", [])}
         host, port = env.get("DB_HOST") or "db-service", int(env.get("DB_PORT") or 5432)
+        self.client_port = port
         result["target"] = f"{host}:{port}"
 
         sel = client["spec"]["selector"].get("matchLabels", {})
+        self.client_labels = client["spec"]["template"].get("metadata", {}).get("labels") or sel
         nodes = [p["spec"].get("nodeName") for p in self.k.items("-n", self.ns, "get", "pods")
                  if matches(sel, p["metadata"].get("labels", {})) and p["status"].get("phase") == "Running"]
         if self.active and nodes:
