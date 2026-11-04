@@ -258,6 +258,20 @@ injected, to count false alarms. The script prints a confusion matrix, accuracy,
 per-fault results, and diagnosis time, and saves everything to
 `eval/results/<timestamp>/`. That's the results table for the report.
 
+### Results on the Pi cluster (8 scenarios × 3 rounds, random order)
+
+| Run | Agent | Accuracy | Mean diagnosis time | Misses |
+|---|---|---|---|---|
+| [run 1](eval/results/20261105-005709/report.txt) | first version | 21/24 = 87.5% | 1.8 s | all 3 `netpol` → `port_mismatch` |
+| [run 2](eval/results/20261105-011047/report.txt) | after the REJECT fix | **24/24 = 100%** | 2.9 s | none |
+
+Run 2 is slower because the port check now makes extra TCP tests and lists
+NetworkPolicies before it settles on a label.
+
+Baseline for the same cluster: [baseline/results/](baseline/results/).
+Node to node: 10.2 ms, MTU 1500, 14.9 Mbit/s. Pod to pod across nodes: 12.7 ms,
+MTU 1450, 13.2 Mbit/s. Pod to pod on the same node: 0.06 ms.
+
 ## Design notes
 
 - **The backend's probes check only the process (`/healthz`), not the DB.** If

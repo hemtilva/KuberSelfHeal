@@ -1,0 +1,24 @@
+
+Confusion matrix (rows = expected, columns = predicted), 24 trials
+
+                        healthy dns_coredn wrong_serv selector_m no_ready_e port_misma      other
+healthy                       3          .          .          .          .          .          .
+dns_coredns_down              .          3          .          .          .          .          .
+wrong_service_name            .          .          3          .          .          .          .
+selector_mismatch             .          .          .          3          .          .          .
+no_ready_endpoints            .          .          .          .          6          .          .
+port_mismatch                 .          .          .          .          .          3          .
+other                         .          .          .          .          .          .          3
+
+accuracy: 24/24 = 100.0%
+diagnosis time: mean 2.9 s, max 3.4 s
+
+per fault:
+  wrong-name   3/3
+  readiness    3/3
+  port         3/3
+  selector     3/3
+  scale0       3/3
+  coredns      3/3
+  netpol       3/3
+  none         3/3
