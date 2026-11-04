@@ -1,0 +1,23 @@
+
+Self-healing, problem set 1: 24 trials
+
+fault       expected    correct  mean heal s  mean mttr s  actions taken
+none        healthy        3/3           1.9            -  (none)
+wrong-name  healed         3/3          12.2          7.5  kubectl -n default set env deploy/backend DB_HOST=db-service
+netpol      escalated      3/3           3.3            -  (none)
+scale0      healed         3/3          12.8          8.1  kubectl -n default scale deploy/database --replicas=1
+selector    healed         3/3           6.9          2.0  kubectl -n default patch svc db-service --type=json
+coredns     healed         3/3          10.4          5.4  kubectl -n kube-system scale deploy/coredns --replicas=1
+port        healed         3/3           7.3          2.0  kubectl -n default patch svc db-service --type=json
+readiness   healed         0/3           3.5            -  (none)
+
+overall correct: 21/24 = 87.5%
+healed (set-1 faults): 15/18
+wrongly touched (netpol/none with an action): 0
+rollbacks: 0
+time to recover after the fix: mean 5.0 s, max 16.5 s
+
+misses:
+  round 1 readiness: escalated - no_ready_endpoints: no unambiguous automatic fix (confidence high)
+  round 2 readiness: escalated - no_ready_endpoints: no unambiguous automatic fix (confidence high)
+  round 3 readiness: escalated - no_ready_endpoints: no unambiguous automatic fix (confidence high)

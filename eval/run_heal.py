@@ -31,7 +31,12 @@ from run_set1 import diagnose, fault, log, wait_healthy  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 EXPECTED = {"none": "healthy", "selector": "healed", "scale0": "healed", "readiness": "healed",
-            "port": "healed", "wrong-name": "healed", "coredns": "healed", "netpol": "escalated"}
+            "port": "healed", "wrong-name": "healed", "coredns": "healed", "netpol": "escalated",
+            # set 2: every injected network fault has a configuration cause, so all are healable
+            "fw-vxlan": "healed", "mtu": "healed", "route": "healed", "loss": "healed", "delay": "healed"}
+SETS = {"1": ["none", "selector", "scale0", "readiness", "port", "wrong-name", "coredns", "netpol"],
+        "2": ["none", "fw-vxlan", "mtu", "route", "loss", "delay"]}
+SETS["all"] = SETS["1"] + SETS["2"][1:]
 
 
 def heal(kubectl):
@@ -49,17 +54,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kubectl", default="kubectl")
     ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--faults", default=",".join(EXPECTED))
+    ap.add_argument("--set", default="1", choices=list(SETS))
+    ap.add_argument("--faults", default=None, help="comma-separated subset (overrides --set)")
     ap.add_argument("--settle", type=float, default=20)
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
-    faults = [f.strip() for f in args.faults.split(",") if f.strip()]
+    faults = [f.strip() for f in args.faults.split(",") if f.strip()] if args.faults else SETS[args.set]
     if unknown := [f for f in faults if f not in EXPECTED]:
         sys.exit(f"unknown fault(s): {unknown}; choose from {list(EXPECTED)}")
     rng = random.Random(args.seed)
     env = {**os.environ, "KUBECTL": args.kubectl}
-    outdir = REPO / "eval" / "results" / ("heal-" + time.strftime("%Y%m%d-%H%M%S"))
+    outdir = REPO / "eval" / "results" / ("heal-" + (f"set{args.set}-" if args.set != "1" else "")
+                                          + time.strftime("%Y%m%d-%H%M%S"))
     outdir.mkdir(parents=True)
 
     log("reset + wait for a healthy starting point")
@@ -120,7 +127,7 @@ def _mean(xs):
 
 
 def report(trials, outdir):
-    lines = [f"\nSelf-healing, problem set 1: {len(trials)} trials\n",
+    lines = [f"\nSelf-healing: {len(trials)} trials\n",
              f"{'fault':<12}{'expected':<11}{'correct':>8}{'mean heal s':>13}{'mean mttr s':>13}  actions taken"]
     for f in dict.fromkeys(t["fault"] for t in trials):
         ft = [t for t in trials if t["fault"] == f]

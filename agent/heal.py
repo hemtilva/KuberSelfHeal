@@ -30,7 +30,10 @@ from diagnose import Diagnoser, Kube  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 HEALABLE = {"dns_coredns_down", "wrong_service_name", "selector_mismatch",
-            "no_ready_endpoints", "port_mismatch"}
+            "no_ready_endpoints", "port_mismatch",
+            # set 2 (healed only when the diagnosis found a configuration cause)
+            "overlay_blocked", "route_missing", "mtu_blackhole", "packet_loss", "high_latency"}
+DIAG_NS = "kuberselfheal"
 
 
 def command_for(action):
@@ -67,6 +70,8 @@ def inverse(action):
         return {**action, "selector": action["previous"], "previous": action["selector"]}
     if t == "patch_target_port":
         return {**action, "value": action["previous"], "previous": action["value"]}
+    if t == "node_cmd":  # undo the steps in reverse order
+        return {**action, "steps": [{**s, "cmd": s["undo"], "undo": s["cmd"]} for s in reversed(action["steps"])]}
     if t == "rollout_undo":
         # The replaced ReplicaSet keeps its revision number, so this restores exactly what we replaced.
         return {**action, "to_revision": action["revision"], "revision": action["to_revision"]}
@@ -86,6 +91,8 @@ class Healer:
         return Diagnoser(self.k, **self.diag_kwargs).run()
 
     def apply(self, action):
+        if action["type"] == "node_cmd":
+            return self.apply_node_cmd(action)
         args, rollout = command_for(action)
         cmd = "kubectl " + " ".join(args)
         self.say(f"applying: {cmd}")
@@ -95,6 +102,21 @@ class Healer:
         if rollout:
             self.k.run("-n", action["ns"], "rollout", "status", rollout, "--timeout=180s", timeout=200)
         return cmd
+
+    def apply_node_cmd(self, action):
+        """Run shell commands on nodes' host network through their diag-host pods."""
+        done = []
+        for s in action["steps"]:
+            pods = [p for p in self.k.items("-n", DIAG_NS, "get", "pods", "-l", "app=diag-host")
+                    if p["spec"].get("nodeName") == s["node"] and p["status"].get("phase") == "Running"]
+            if not pods:
+                raise RuntimeError(f"no diag-host pod on {s['node']}")
+            self.say(f"on {s['node']}: {s['cmd']}")
+            rc, out, err = self.k.sh(DIAG_NS, pods[0]["metadata"]["name"], s["cmd"])
+            if rc != 0:
+                raise RuntimeError(f"on {s['node']}: {s['cmd']} failed: {(out + err).strip()[:200]}")
+            done.append(f"on {s['node']}: {s['cmd']}")
+        return "; ".join(done)
 
     def verify(self, fault_label):
         """Wait until the app really works. Returns (status, last_result, seconds) where
@@ -159,8 +181,11 @@ class Healer:
             step = {"label": label, "problem": r.get("problem"), "summary": r["summary"],
                     "evidence": r["evidence"], "action": action}
             if self.dry_run:
-                args, _ = command_for(action)
-                step["would_run"] = "kubectl " + " ".join(args)
+                if action["type"] == "node_cmd":
+                    step["would_run"] = "; ".join(f"on {s['node']}: {s['cmd']}" for s in action["steps"])
+                else:
+                    args, _ = command_for(action)
+                    step["would_run"] = "kubectl " + " ".join(args)
                 report["steps"].append(step)
                 report["outcome"] = "planned"
                 break

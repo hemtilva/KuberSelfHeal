@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Diagnose why the backend can't reach its database: problem set 1.
+"""Diagnose why the backend can't reach its database: problem sets 1 and 2.
 
 Set 1 = Service discovery & DNS. The agent follows the path the backend's
 connection takes and stops at the first broken link:
@@ -13,8 +13,14 @@ Labels:
     selector_mismatch   (7)  the Service's selector matches no pods
     no_ready_endpoints  (8)  pods match, but none are Ready (or the workload is scaled to 0)
     port_mismatch       (9)  Service port / targetPort doesn't reach the port Postgres listens on
-    other               the app fails but every set-1 check passes: some other layer
-                        (network, firewall, MTU, NetworkPolicy, ...), left for later sets
+  set 2 (agent/network.py, runs only if every set-1 check passed):
+    overlay_blocked     (4)  a firewall rule drops the VXLAN tunnel (UDP 8472)
+    route_missing       (2)  a node has no route to the other node's pod network
+    mtu_blackhole       (5)  full-size packets vanish on the tunnel, bulk TCP stalls
+    packet_loss         (28) pod-to-pod loss far above the baseline
+    high_latency        (27) pod-to-pod RTT far above the baseline
+    other               the app fails but every set-1 and set-2 check passes
+                        (e.g. a NetworkPolicy), or the Wi-Fi itself is down
 
 Run on the control-plane Pi (standard library + kubectl):
 
@@ -46,6 +52,7 @@ DIAG_NS = "kuberselfheal"
 LABELS = {  # label -> problem number from the 60-problem list
     "healthy": None, "dns_coredns_down": 14, "wrong_service_name": 12,
     "selector_mismatch": 7, "no_ready_endpoints": 8, "port_mismatch": 9, "other": None,
+    "overlay_blocked": 4, "route_missing": 2, "mtu_blackhole": 5, "packet_loss": 28, "high_latency": 27,
 }
 
 
@@ -83,6 +90,17 @@ def pod_age_s(pod):
         return 0.0
     started = datetime.datetime.fromisoformat(start.replace("Z", "+00:00"))
     return (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
+
+
+def not_ready_since_start(pod):
+    """True if the pod is not Ready and its Ready condition hasn't changed since it started
+    (i.e. it has never been Ready)."""
+    cond = next((c for c in pod.get("status", {}).get("conditions", []) if c.get("type") == "Ready"), None)
+    start = pod.get("status", {}).get("startTime")
+    if not cond or cond.get("status") == "True" or not start or not cond.get("lastTransitionTime"):
+        return False
+    parse = lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    return (parse(cond["lastTransitionTime"]) - parse(start)).total_seconds() < 15
 
 
 def matches(selector, labels):
@@ -367,21 +385,27 @@ class Diagnoser:
             dname = dep["metadata"]["name"]
             rev = int(dep["metadata"].get("annotations", {}).get("deployment.kubernetes.io/revision", "1"))
             ages = [pod_age_s(p) for p in selected]
-            # Roll back only if the CURRENT revision never finished rolling out: then a recent
-            # change is the likely cause. If it once served fine (NewReplicaSetAvailable), the
-            # problem is something else and rolling back could restore an older bad template.
-            prog = next((c for c in dep.get("status", {}).get("conditions", []) if c.get("type") == "Progressing"), {})
-            rollout_done = prog.get("reason") == "NewReplicaSetAvailable"
+            # Roll back only if the CURRENT revision's pods have never been Ready since they
+            # started: then the new template itself is bad, and the previous one is the fix.
+            # (A pod that was Ready and later broke points at something else; rolling back
+            # could restore an older bad template. The Deployment's Progressing condition
+            # is not reliable for this with the Recreate strategy, so we look at the pods.)
             dsel = ",".join(f"{k}={v}" for k, v in dep["spec"]["selector"].get("matchLabels", {}).items())
-            revs = {int(rs["metadata"].get("annotations", {}).get("deployment.kubernetes.io/revision", "0"))
-                    for rs in self.k.items("-n", ns, "get", "replicaset", "-l", dsel)
-                    if any(o.get("kind") == "Deployment" and o.get("name") == dname
-                           for o in rs["metadata"].get("ownerReferences", []))}
-            prev = max((r for r in revs if r < rev), default=None)
-            evidence.append(f"deploy/{dname} is at revision {rev}, rollout "
-                            + ("completed earlier" if rollout_done else f"not completed ({prog.get('reason')})")
+            rss = [rs for rs in self.k.items("-n", ns, "get", "replicaset", "-l", dsel)
+                   if any(o.get("kind") == "Deployment" and o.get("name") == dname
+                          for o in rs["metadata"].get("ownerReferences", []))]
+            by_rev = {int(rs["metadata"].get("annotations", {}).get("deployment.kubernetes.io/revision", "0")): rs
+                      for rs in rss}
+            prev = max((r for r in by_rev if r < rev), default=None)
+            cur_hash = by_rev.get(rev, {}).get("metadata", {}).get("labels", {}).get("pod-template-hash")
+            current = [p for p in selected if cur_hash and
+                       p["metadata"].get("labels", {}).get("pod-template-hash") == cur_hash]
+            never_ready = bool(current) and all(not_ready_since_start(p) for p in current)
+            evidence.append(f"deploy/{dname} is at revision {rev}; its pods have "
+                            + ("never been Ready since they started" if never_ready
+                               else "been Ready before (or belong to an older revision)")
                             + f"; youngest pod is {min(ages):.0f} s old")
-            if prev and not rollout_done:
+            if prev and never_ready:
                 action = {"type": "rollout_undo", "ns": ns, "name": dname, "revision": rev,
                           "to_revision": prev, "pod_age_s": min(ages)}
                 fix = f"kubectl -n {ns} rollout undo deploy/{dname} --to-revision={prev}  (revision {rev} never became ready)"
@@ -497,6 +521,10 @@ class Diagnoser:
                     ready = self.check_endpoints(svc, selected)
                     if ready:
                         self.check_ports(svc, ready, port)
+                        # Set 2: only when the Kubernetes-level path is fine.
+                        if not self.findings and self.diag_pod:
+                            from network import NetworkChecks
+                            NetworkChecks(self).run(nodes[0] if nodes else None, ready[0])
         return self.finish(start, result)
 
     def finish(self, start, result, error=None):
@@ -520,7 +548,7 @@ class Diagnoser:
                        "fix": None}
         else:
             primary = {"label": "healthy", "confidence": "high" if symptom else "low",
-                       "summary": "app works and all set-1 checks passed" if symptom
+                       "summary": "app works and all checks passed" if symptom
                                   else "all set-1 checks passed (app not probed: no diag-pod)",
                        "evidence": [], "fix": None}
         primary = {**primary, "problem": LABELS[primary["label"]]}
