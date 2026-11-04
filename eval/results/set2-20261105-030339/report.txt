@@ -1,0 +1,21 @@
+
+Confusion matrix (rows = expected, columns = predicted), 18 trials
+
+                        healthy overlay_bl route_miss mtu_blackh packet_los high_laten
+healthy                       3          .          .          .          .          .
+overlay_blocked               .          3          .          .          .          .
+route_missing                 .          .          3          .          .          .
+mtu_blackhole                 .          .          .          3          .          .
+packet_loss                   .          .          .          .          3          .
+high_latency                  .          .          .          .          .          3
+
+accuracy: 18/18 = 100.0%
+diagnosis time: mean 14.1 s, max 21.3 s
+
+per fault:
+  route        3/3
+  delay        3/3
+  loss         3/3
+  none         3/3
+  mtu          3/3
+  fw-vxlan     3/3

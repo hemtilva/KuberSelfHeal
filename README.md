@@ -23,7 +23,7 @@ labels anything outside the current set as `other`.
 | Set | Layer | Problems | Status |
 |---|---|---|---|
 | 1 | Service discovery & DNS | 7, 8, 9, 12, 14 | implemented |
-| 2 | Cross-node network (firewall, MTU, routing, loss) | 2, 4, 5, 28 | next |
+| 2 | Cross-node network (firewall, MTU, routing, loss, latency) | 2, 4, 5, 27, 28 | implemented |
 
 ## 0. Cluster on a phone hotspot
 
@@ -310,6 +310,57 @@ python3 agent/heal.py --dry-run     # show the plan only
 python3 agent/heal.py               # heal for real
 python3 eval/run_heal.py --rounds 3 # score it: heal success, time to recover
 ```
+
+## 7. Problem set 2: the cross-node network
+
+Set 2 looks *below* Kubernetes, at the path a packet takes between the two Pis.
+It runs only when every set-1 check passed ([agent/network.py](agent/network.py)):
+
+```
+backend pod (user1) ─cni0─► flannel.1 ══ VXLAN, UDP 8472, over wlan0 (hotspot) ══► flannel.1 ─cni0─► DB pod (user2)
+                            └──────────────── overlay (pod → pod) ────────────────┘
+                     └───────────────────────── underlay (node → node) ──────────────────────────┘
+```
+
+The key idea is to **compare layers and compare with the baseline**:
+
+| Measurement | Healthy (baseline) | What a deviation means |
+|---|---|---|
+| node → node ping (underlay) | 0% loss | 100% loss: the Wi-Fi itself is down (`other`, a human must look) |
+| pod → pod ping (overlay) | 0% loss, 12.7 ms | ≥90% loss while the underlay works: tunnel broken (route or firewall) |
+| | | high loss / RTT while the underlay is fine: shaping on the tunnel |
+| DF ping at 1450 bytes | passes | fails while small packets pass: MTU blackhole |
+| bulk TCP (iperf3) | ~13 Mbit/s | stalls: the MTU problem actually hurts |
+
+| Label | Problem | Injected (on the overlay only) | Detected by | Healed by |
+|---|---|---|---|---|
+| `overlay_blocked` | 4 | `iptables DROP udp/8472` on the DB node | overlay down + a DROP/REJECT rule on 8472 | deleting that rule |
+| `route_missing` | 2 | `ip route del` of the DB node's pod network on the backend node | `ip route get <db pod>` doesn't use `flannel.1` | `ip route replace … dev flannel.1 onlink` |
+| `mtu_blackhole` | 5 | drop inner packets > 1200 bytes (an MTU-limited link with no ICMP) | DF-ping path MTU 1200 < 1450, bulk TCP stalls | **TCP MSS clamping** to the measured path (1160) on both nodes |
+| `packet_loss` | 28 | `tc netem loss 40%` | pod loss ≫ baseline, underlay clean, netem rule found | removing the netem rule |
+| `high_latency` | 27 | `tc netem delay 150ms` | pod RTT ≫ baseline, underlay clean, netem rule found | removing the netem rule |
+
+Faults are injected **only on `flannel.1` / UDP 8472, never on `wlan0`**, so SSH
+and the Kubernetes API keep working. Each one also schedules its own undo after
+5 minutes.
+
+```bash
+bash faults/fault.sh inject mtu
+python3 agent/diagnose.py         # -> mtu_blackhole (problem 5)
+python3 agent/heal.py             # -> clamps MSS, verifies bulk TCP works again
+bash faults/fault.sh reset
+python3 eval/run_set1.py --set 2 --rounds 3   # score detection
+python3 eval/run_heal.py --set 2 --rounds 3   # score healing
+```
+
+**Findings from the real cluster:**
+- **Flannel does not restore a deleted route by itself.** It was still missing after 45 s, so this is a failure Kubernetes doesn't heal.
+- **On k3s, the underlay vs overlay comparison is what separates the causes.** During the loss fault, node → node stayed at 0% while pod → pod lost 30%.
+- **The MTU fix is a mitigation, the way it's done in real networks.** The small-MTU path stays, but TCP now negotiates segments that fit through it.
+- **Safety rules learned from review:**
+  - a fix that *removed* a fault (a rule, a qdisc, a route) is never rolled back, because that would re-create the fault;
+  - loss and latency are confirmed with a second sample, so a momentary hotspot stall isn't a false alarm;
+  - loss or latency with **no** configuration cause is reported as the physical link and never "fixed".
 
 ## Design notes
 

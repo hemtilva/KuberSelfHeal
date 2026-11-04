@@ -110,6 +110,24 @@ class NetworkChecks:
         if loss >= 90:
             self.overlay_down()
             return
+
+        def bad(l, r):
+            return (l > max(LOSS_MIN_PCT, base["loss_pct"] + 10) or
+                    (r is not None and r > base["rtt_avg_ms"] + LATENCY_EXTRA_MS and r > 2 * base["rtt_avg_ms"]))
+        if bad(loss, rtt):
+            # One ~3 s burst can hit a momentary hotspot stall: confirm with a second sample.
+            _, out2 = self.in_pod(f"ping -c 30 -i 0.1 -W 1 {dst}", timeout=40)
+            p2 = parse_ping(out2)
+            if p2.get("loss_pct") is not None and not bad(p2["loss_pct"], p2.get("rtt_avg_ms")):
+                self.d.check("overlay", True, f"first sample looked bad ({loss}% loss, {rtt} ms) but a second "
+                                              f"one was normal ({p2['loss_pct']}%, {p2.get('rtt_avg_ms')} ms): "
+                                              "transient Wi-Fi blip, ignored")
+                loss, rtt = p2["loss_pct"], p2.get("rtt_avg_ms")
+                self.ctx["pod_ping"] = p2
+            elif p2.get("loss_pct") is not None and p2["loss_pct"] < loss:
+                # confirmed: report the better (more conservative) of the two samples
+                loss, rtt = p2["loss_pct"], p2.get("rtt_avg_ms")
+                self.ctx["pod_ping"] = p2
         if loss > max(LOSS_MIN_PCT, base["loss_pct"] + 10):
             self.degraded("packet_loss", f"pod -> pod loss {loss}% (baseline {base['loss_pct']}%)")
             return
@@ -135,8 +153,16 @@ class NetworkChecks:
         for node, peer, ip in ((c["client"], c["server"], c["dst"]), (c["server"], c["client"], client_pod_ip)):
             if not ip:
                 continue
-            route = " ".join((self.on_host(node, f"ip route get {ip}") or "").split())
-            if route and "flannel.1" not in route:
+            hpod = self.diag("diag-host", node)
+            if not hpod:
+                continue
+            rc, out, err = self.k.sh(DIAG_NS, hpod["metadata"]["name"], f"ip route get {ip}")
+            route = " ".join(out.split())
+            if rc != 0 or not route.startswith(ip) or " dev " not in route:
+                self.d.check("routes", None, f"could not read the route on {node}: "
+                                             f"{' '.join((out + err).split())[:120]}")
+                continue  # unknown: never claim route_missing from a failed probe
+            if "flannel.1" not in route:
                 cidr = c["nodes"][peer]["cidr"]
                 gw = cidr.split("/")[0]
                 self.d.find("route_missing", "high",
@@ -144,7 +170,7 @@ class NetworkChecks:
                             evidence + [f"on {node}: ip route get {ip} -> {route[:120]}",
                                         f"expected: {cidr} via {gw} dev flannel.1 onlink (flannel VXLAN route)"],
                             f"on {node}: ip route replace {cidr} via {gw} dev flannel.1 onlink",
-                            {"type": "node_cmd", "steps": [{
+                            {"type": "node_cmd", "rollback": False, "steps": [{
                                 "node": node, "cmd": f"ip route replace {cidr} via {gw} dev flannel.1 onlink",
                                 "undo": f"ip route del {cidr}"}]})
                 return
@@ -162,7 +188,7 @@ class NetworkChecks:
             self.d.find("overlay_blocked", "high",
                         "a firewall rule drops the VXLAN tunnel (UDP 8472) between the nodes",
                         evidence + found, "; ".join(f"on {s['node']}: {s['cmd']}" for s in steps),
-                        {"type": "node_cmd", "steps": steps})
+                        {"type": "node_cmd", "rollback": False, "steps": steps})
             return
         self.d.check("firewall", True, "no rule drops or rejects UDP 8472 on either node")
         self.d.other_evidence += evidence + ["routes and firewall look correct: check flannel on both nodes "
@@ -188,10 +214,10 @@ class NetworkChecks:
         if steps:
             self.d.find(label, "high", f"high {what} on the pod path, caused by a traffic-control (netem) rule",
                         evidence, "; ".join(f"on {s['node']}: {s['cmd']}" for s in steps),
-                        {"type": "node_cmd", "steps": steps})
+                        {"type": "node_cmd", "rollback": False, "steps": steps})
         else:
             # No configuration cause: on a Wi-Fi hotspot this is physical. Report, don't touch.
-            self.d.find(label, "high", f"high {what} on the pod path, with no configuration cause found "
+            self.d.find(label, "medium", f"high {what} on the pod path, with no configuration cause found "
                                        "(likely the physical/Wi-Fi link)",
                         evidence + ["no netem/shaping rule on either node"],
                         "check Wi-Fi signal and distance to the hotspot; nothing to change automatically")
@@ -222,11 +248,17 @@ class NetworkChecks:
         if target:
             rc, out = self.in_pod(f"timeout 12 iperf3 -c {target} -p 5201 -t 2 -J", timeout=25)
             tcp = parse_iperf(out)
-            if "error" in tcp and ('"connected"' in out or rc in (124, 143)):
-                # connected, then killed by `timeout` mid-transfer: the data stalled
-                tcp = {"error": "connected, but the transfer stalled (killed after 12 s)"}
-            elif "error" in tcp and "busy" in tcp["error"]:
-                tcp = None  # iperf3 server busy: unknown, don't conclude anything
+            if "error" in tcp:
+                err = tcp["error"].lower()
+                # When `timeout` kills iperf3 mid-transfer its JSON is cut off, so match text:
+                # a NON-EMPTY "connected": [{...}] list means the TCP session was established.
+                connected = re.search(r'"connected"\s*:\s*\[\s*\{', out) is not None
+                if any(s in err for s in ("busy", "unable to connect", "refused")):
+                    tcp = None  # server busy/unreachable: bulk TCP not measured
+                elif connected or rc in (124, 143):
+                    tcp = {"error": "connected, but the transfer stalled (killed after 12 s)"}
+                else:
+                    tcp = None  # no iperf3 output at all (e.g. kubectl exec failed): unknown
         evidence = [f"path MTU pod -> pod is {pmtu} bytes, baseline {base_mtu}: "
                     f"packets of {pmtu + 1}-{base_mtu} bytes silently disappear (no ICMP 'too big')",
                     "small packets and pings pass, so the connection looks fine until something large is sent"]

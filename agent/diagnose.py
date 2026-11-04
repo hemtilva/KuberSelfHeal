@@ -524,7 +524,10 @@ class Diagnoser:
                         # Set 2: only when the Kubernetes-level path is fine.
                         if not self.findings and self.diag_pod:
                             from network import NetworkChecks
-                            NetworkChecks(self).run(nodes[0] if nodes else None, ready[0])
+                            try:
+                                NetworkChecks(self).run(nodes[0] if nodes else None, ready[0])
+                            except Exception as exc:  # a set-2 problem must never hide set-1 results
+                                self.check("network", None, f"set-2 checks could not run: {exc}"[:200])
         return self.finish(start, result)
 
     def finish(self, start, result, error=None):

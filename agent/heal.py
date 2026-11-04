@@ -71,6 +71,8 @@ def inverse(action):
     if t == "patch_target_port":
         return {**action, "value": action["previous"], "previous": action["value"]}
     if t == "node_cmd":  # undo the steps in reverse order
+        if action.get("rollback") is False:
+            return None  # the fix REMOVED a fault (rule/qdisc/route): undoing it would re-create the fault
         return {**action, "steps": [{**s, "cmd": s["undo"], "undo": s["cmd"]} for s in reversed(action["steps"])]}
     if t == "rollout_undo":
         # The replaced ReplicaSet keeps its revision number, so this restores exactly what we replaced.
@@ -205,6 +207,8 @@ class Healer:
                 if undo:
                     self.say("the fault is still there: undoing the change")
                     step["rolled_back"] = self.apply(undo)
+                elif action["type"] == "node_cmd":
+                    step["kept"] = "fix kept: it removed a faulty rule/route, so undoing it would re-create the fault"
                 report["steps"].append(step)
                 report.update(outcome="failed", reason=f"{label} persisted {secs} s after the fix",
                               diagnosis=summary(after))
