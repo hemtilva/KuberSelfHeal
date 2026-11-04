@@ -8,3 +8,7 @@ __pycache__/
 
 # ad-hoc prober output (baseline/results/ IS committed: it's the reference data)
 probes*.jsonl
+
+# eval runs started with nohup on the Pi
+eval_run*.log
+*.pid
