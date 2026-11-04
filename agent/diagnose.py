@@ -106,6 +106,7 @@ class Diagnoser:
         self.active = active
         self.diag_pod = None
         self.findings, self.checks = [], []
+        self.other_evidence = []  # clues for the "other" label (e.g. NetworkPolicies on the DB pod)
 
     # --- bookkeeping ---
 
@@ -119,32 +120,63 @@ class Diagnoser:
     # --- active tests, run from the diag-pod on the backend's node ---
 
     def tcp(self, ip, port):
-        """'open' | 'refused' | 'timeout' | None (no diag pod)."""
+        """'open' | 'refused' | 'timeout' | None (no diag pod, or kubectl exec itself failed)."""
         if not self.diag_pod:
             return None
         rc, out, err = self.k.sh(DIAG_NS, self.diag_pod, f"nc -zv -w 3 {ip} {port} 2>&1")
         if rc == 0:
             return "open"
-        return "refused" if "refused" in (out + err).lower() else "timeout"
+        text = (out + err).lower()
+        if "nc:" not in text and "connect" not in text:
+            # No output from nc at all: the exec failed (timeout, stream error over the
+            # hotspot, diag pod restarting). That says nothing about the port.
+            self.check("active_tests", None, f"TCP test to {ip}:{port} could not run: "
+                                             + " ".join((out + err).split())[:120])
+            return None
+        return "refused" if "refused" in text else "timeout"
 
     def probe_app(self):
-        """Ask the backend for the DB value, through its ClusterIP (not DNS, which may be broken)."""
+        """Ask the backend for the DB value, through its ClusterIP (not DNS, which may be broken).
+
+        Tries twice, so one lost packet on the hotspot doesn't turn a healthy cluster
+        into a false alarm. Returns None if curl never ran (exec failed): unknown, not a failure.
+        """
         svc = self.k.get("-n", self.ns, "get", "svc", self.client_service)
         if not svc or not self.diag_pod:
             return None
         ip, port = svc["spec"]["clusterIP"], svc["spec"]["ports"][0]["port"]
-        rc, out, _ = self.k.sh(DIAG_NS, self.diag_pod,
-                               f"curl -s -m 12 -w '\\n%{{http_code}}' http://{ip}:{port}/", timeout=20)
-        body, _, code = out.rstrip().rpartition("\n")
+        for attempt in range(2):
+            if attempt:
+                time.sleep(1)
+            rc, out, err = self.k.sh(DIAG_NS, self.diag_pod,
+                                     f"curl -s -m 12 -w '\\n%{{http_code}}' http://{ip}:{port}/", timeout=20)
+            body, _, code = out.rstrip().rpartition("\n")
+            code = code.strip()
+            if code == "200":
+                return {"ok": True, "http_status": 200, "attempts": attempt + 1}
+        if not code.isdigit():  # curl always prints a code (000 if it couldn't connect)
+            self.check("app_probe", None, "could not run curl in the diag pod: "
+                                          + " ".join((out + err).split())[:120])
+            return None
         try:
             data = json.loads(body)
         except ValueError:
             data = {}
-        if code.strip() == "200":
-            return {"ok": True, "http_status": 200}
-        error = data.get("error") or f"backend unreachable at {ip}:{port} (curl exit {rc})"
-        return {"ok": False, "http_status": int(code) if code.strip().isdigit() else None,
+        error = data.get("error") or f"backend unreachable at {ip}:{port} (curl exit {rc}, HTTP {code})"
+        return {"ok": False, "http_status": int(code) or None, "attempts": 2,
                 "phase": data.get("phase"), "error": error, "hint": hint_for(error)}
+
+    def policies_selecting(self, pod):
+        """NetworkPolicies in the pod's namespace whose podSelector selects it."""
+        found = []
+        labels = pod["metadata"].get("labels", {})
+        for np in self.k.items("-n", pod["metadata"].get("namespace", self.ns), "get", "networkpolicy"):
+            ps = np["spec"].get("podSelector", {})
+            if ps.get("matchExpressions") or matches(ps.get("matchLabels", {}), labels):
+                types = ",".join(np["spec"].get("policyTypes", ["Ingress"]))
+                found.append(f"NetworkPolicy {np['metadata']['name']} ({types}) selects pod "
+                             f"{pod['metadata']['name']}")
+        return found
 
     # --- set-1 checks, in path order ---
 
@@ -301,21 +333,36 @@ class Diagnoser:
         if state:
             evidence.append(f"TCP {pod_ip}:{tp} from the backend's node: {state}")
 
+        # 'refused' alone does NOT prove a wrong port: k3s's NetworkPolicy controller
+        # (kube-router) REJECTs denied traffic, which also looks like "connection refused".
+        # So we need positive evidence that the port is wrong: the targetPort isn't a
+        # declared port, or another declared port is open on the same pod.
+        open_alts = []
         if state == "refused":
-            for alt in declared:
-                if alt != tp and self.tcp(pod_ip, alt) == "open":
-                    evidence.append(f"TCP {pod_ip}:{alt}: open  <- the pod is listening here")
+            open_alts = [alt for alt in declared if alt != tp and self.tcp(pod_ip, alt) == "open"]
+            for alt in open_alts:
+                evidence.append(f"TCP {pod_ip}:{alt}: open  <- the pod is listening here")
+        wrong_port = bool(open_alts) or bool(declared and tp not in declared)
+
+        if state == "refused" and wrong_port:
+            fix_port = open_alts[0] if open_alts else declared[0]
             self.find("port_mismatch", "high",
                       f"Service {name} forwards to port {tp}, but nothing listens there on the pod",
                       evidence, f"kubectl -n {ns} patch svc {name} --type=json -p '"
                                 + json.dumps([{"op": "replace", "path": f"/spec/ports/{ports.index(sp)}/targetPort",
-                                               "value": declared[0] if declared else "<port>"}]) + "'")
-        elif state is None and declared and tp not in declared:
+                                               "value": fix_port}]) + "'")
+        elif state != "open" and wrong_port:
             self.find("port_mismatch", "medium",
-                      f"Service {name} targetPort {tp} is not a port the pod declares (no active test available)",
+                      f"Service {name} targetPort {tp} is not a port the pod declares "
+                      + ("(no active test available)" if state is None else f"(active test inconclusive: {state})"),
                       evidence, f"set targetPort of Service {name} to {declared[0]}")
+        elif state in ("refused", "timeout"):
+            # Port is right but traffic doesn't get through: not a set-1 problem.
+            self.other_evidence += evidence + self.policies_selecting(pod)
+            self.check("ports", None, f"targetPort {tp} is the pod's declared port, but TCP is {state}: "
+                                      "traffic is blocked or dropped on the way (not a set-1 problem)")
         else:
-            self.check("ports", True if state in ("open", None) else None, "; ".join(evidence))
+            self.check("ports", True, "; ".join(evidence))
 
     # --- main ---
 
@@ -366,13 +413,16 @@ class Diagnoser:
             primary = self.findings[0]
         elif symptom and not symptom["ok"]:
             hint = symptom.get("hint")
+            why = {"timeout": "timeout with a correct Service -> packets are silently dropped: "
+                              "firewall DROP (e.g. VXLAN UDP 8472), MTU or routing (later sets)",
+                   "refused": "refused although Service, endpoints and port are correct -> something "
+                              "actively rejects the traffic: a NetworkPolicy (k3s/kube-router REJECTs "
+                              "denied packets) or a firewall REJECT rule (later sets)"}.get(hint)
             primary = {"label": "other", "confidence": "medium",
                        "summary": "the backend cannot reach the database, but every set-1 check passed: "
                                   "the problem is in another layer",
-                       "evidence": [f"app error: {symptom['error'][:200]}", f"error type: {hint}"]
-                                   + (["timeout with a correct Service -> packets are dropped: "
-                                       "NetworkPolicy, firewall (VXLAN UDP 8472), MTU or routing (later sets)"]
-                                      if hint == "timeout" else []),
+                       "evidence": [f"app error: {' '.join(symptom['error'].split())[:200]}", f"error type: {hint}"]
+                                   + ([why] if why else []) + self.other_evidence,
                        "fix": None}
         else:
             primary = {"label": "healthy", "confidence": "high" if symptom else "low",

@@ -61,10 +61,14 @@ def diagnose(kubectl):
 
 
 def wait_healthy(kubectl, timeout):
+    """Healthy = the agent says healthy AND the app really answered (not a config-only guess)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        r, _ = diagnose(kubectl)
-        if r.get("label") == "healthy":
+        try:
+            r, _ = diagnose(kubectl)
+        except subprocess.TimeoutExpired:
+            continue
+        if r.get("label") == "healthy" and (r.get("symptom") or {}).get("ok"):
             return True
         time.sleep(5)
     return False
@@ -93,38 +97,46 @@ def main():
     log("reset + wait for a healthy starting point")
     fault(env, "reset")
     if not wait_healthy(args.kubectl, 300):
-        sys.exit("cluster is not healthy after reset; run agent/diagnose.py to see why")
+        sys.exit("cluster is not healthy after reset (or no diag-pod, so the app can't be probed); "
+                 "run agent/diagnose.py to see why")
 
     trials = []
-    for rnd in range(1, args.rounds + 1):
-        order = faults[:]
-        rng.shuffle(order)
-        for f in order:
-            log(f"round {rnd}: {f}")
-            injected_at = time.time()
-            try:
-                if f != "none":
-                    fault(env, "inject", f)
-                time.sleep(args.settle)
-                result, took = diagnose(args.kubectl)
-            except Exception as exc:  # keep going; record the failure
-                result, took = {"label": "ERROR", "summary": str(exc)}, None
-            finally:
-                fault(env, "reset")
-            recovered = wait_healthy(args.kubectl, 300)
-            trial = {"round": rnd, "fault": f, "expected": EXPECTED[f], "predicted": result.get("label"),
-                     "correct": result.get("label") == EXPECTED[f], "confidence": result.get("confidence"),
-                     "diagnosis_s": took, "injected_at": injected_at, "recovered": recovered,
-                     "summary": result.get("summary"), "result": result}
-            trials.append(trial)
-            with open(trials_file, "a", encoding="utf-8") as out:
-                out.write(json.dumps(trial) + "\n")
-            log(f"  expected {trial['expected']:<20} got {trial['predicted']:<20} "
-                f"{'OK' if trial['correct'] else 'WRONG'}  ({took} s)")
-            if not recovered:
-                sys.exit("cluster did not recover after reset; stopping (see trials.jsonl)")
-
-    report(trials, outdir)
+    try:
+        for rnd in range(1, args.rounds + 1):
+            order = faults[:]
+            rng.shuffle(order)
+            for f in order:
+                log(f"round {rnd}: {f}")
+                injected_at = time.time()
+                try:
+                    if f != "none":
+                        fault(env, "inject", f)
+                    time.sleep(args.settle)
+                    result, took = diagnose(args.kubectl)
+                except Exception as exc:  # keep going; record the failure
+                    result, took = {"label": "ERROR", "summary": str(exc)}, None
+                reset_error = None
+                try:
+                    fault(env, "reset")
+                except Exception as exc:  # a slow rollout must not lose this trial or the report
+                    reset_error = str(exc)
+                    log(f"  reset failed: {exc}")
+                recovered = wait_healthy(args.kubectl, 300)
+                trial = {"round": rnd, "fault": f, "expected": EXPECTED[f], "predicted": result.get("label"),
+                         "correct": result.get("label") == EXPECTED[f], "confidence": result.get("confidence"),
+                         "diagnosis_s": took, "injected_at": injected_at, "recovered": recovered,
+                         "reset_error": reset_error, "summary": result.get("summary"), "result": result}
+                trials.append(trial)
+                with open(trials_file, "a", encoding="utf-8") as out:
+                    out.write(json.dumps(trial) + "\n")
+                log(f"  expected {trial['expected']:<20} got {trial['predicted']:<20} "
+                    f"{'OK' if trial['correct'] else 'WRONG'}  ({took} s)")
+                if not recovered:
+                    log("cluster did not recover after reset; stopping early (see trials.jsonl)")
+                    return
+    finally:
+        if trials:
+            report(trials, outdir)
 
 
 def report(trials, outdir):

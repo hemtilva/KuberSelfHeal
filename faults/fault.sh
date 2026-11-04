@@ -72,7 +72,7 @@ EOF
 reset() {
   $K -n "$NS" delete networkpolicy -l kuberselfheal/fault=true --ignore-not-found >/dev/null
   $K -n kube-system scale deploy/coredns --replicas=1 >/dev/null
-  $K apply -f "$REPO/k8s/app.yaml" >/dev/null
+  $K -n "$NS" apply -f "$REPO/k8s/app.yaml" >/dev/null
   $K -n kube-system rollout status deploy/coredns --timeout=300s >/dev/null
   wait_rollouts
   echo "reset done"

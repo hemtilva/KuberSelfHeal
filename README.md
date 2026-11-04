@@ -148,9 +148,9 @@ Each line in `probes.jsonl` records `ok`, `latency_ms`, `where`, `phase`, `hint`
 | hint | Meaning | Likely causes |
 |---|---|---|
 | `dns` | Name didn't resolve | Wrong namespace or hostname, CoreDNS down |
-| `refused` | Reached a host, nothing listening | Wrong `targetPort`, no endpoints |
+| `refused` | Nothing listening, or something actively rejected the connection | Wrong `targetPort`, no endpoints, **NetworkPolicy** (k3s REJECTs denied traffic) |
 | `no_route` | Rejected before connecting | No endpoints (kube-proxy REJECT), broken routing |
-| `timeout` | Packets disappeared | Firewall (VXLAN UDP 8472), MTU, NetworkPolicy, overlay, packet loss |
+| `timeout` | Packets silently disappeared | Firewall DROP (VXLAN UDP 8472), MTU, overlay, packet loss |
 
 ### Smoke test: a fault the setup should survive
 
@@ -213,14 +213,21 @@ DB_HOST ──DNS──► Service ──selector──► Pods ──readiness�
 | `wrong_service_name` | 12 | The Service named by the backend's `DB_HOST` doesn't exist (suggests similar names) |
 | `selector_mismatch` | 7 | The selector matches 0 pods, and no workload is meant to provide them; shows the closest labels |
 | `no_ready_endpoints` | 8 | Pods match but none are Ready (with probe events), or the workload is scaled to 0 |
-| `port_mismatch` | 9 | TCP to `podIP:targetPort` is **refused**, while the pod's declared port is open |
+| `port_mismatch` | 9 | `targetPort` is not a port the pod declares, **and** TCP to it is refused while a declared port is open |
 | `other` | – | The app fails but every check above passes, so the cause is in another layer |
 | `healthy` | – | The app works and every check passes |
 
 Most checks compare Kubernetes objects (category A). The port check also runs
-an active TCP test (category C) from the diag pod on the backend's node. A
-**timeout**, as opposed to a refusal, is never labelled a port problem: it means
-packets are being dropped, which belongs to set 2.
+an active TCP test (category C) from the diag pod on the backend's node.
+
+**Lesson from the first real run:** "connection refused" does *not* prove a
+wrong port. k3s's NetworkPolicy controller (kube-router) **REJECTs** denied
+traffic, and the client sees the same `ECONNREFUSED`. The first evaluation
+labelled the `netpol` fault as `port_mismatch`. The agent now needs positive
+evidence before it says `port_mismatch`: the targetPort isn't declared, or
+another port on the same pod is open. If the port is right but traffic is
+refused or times out, the result is `other`, and the evidence lists any
+NetworkPolicies that select the DB pod.
 
 ```bash
 python3 agent/diagnose.py                    # human-readable report
