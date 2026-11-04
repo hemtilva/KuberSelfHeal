@@ -1,0 +1,73 @@
+# Diagnostic toolbox, one copy per node. Used for the baseline now, and later by
+# the diagnosis agent for active tests (category C) and node-level checks.
+#
+#   diag-host : hostNetwork + privileged, so it sees the NODE's network:
+#               wlan0, routes, iptables, conntrack, flannel.1, dmesg.
+#   diag-pod  : a normal pod on the pod network, so its traffic goes through
+#               the CNI / VXLAN overlay exactly like the app's traffic.
+#
+# Both run iperf3 servers (host: 5202, pod: 5201) for throughput tests.
+# Note: nicolaka/netshoot is large (a few hundred MB per node). On a phone
+# hotspot, the first pull uses mobile data and takes a while.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kuberselfheal
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: diag-host
+  namespace: kuberselfheal
+spec:
+  selector:
+    matchLabels:
+      app: diag-host
+  template:
+    metadata:
+      labels:
+        app: diag-host
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - operator: Exists          # also run on the control-plane Pi
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: netshoot
+          image: nicolaka/netshoot:v0.13
+          command: ["sh", "-c", "iperf3 -s -p 5202 & exec sleep infinity"]
+          securityContext:
+            privileged: true
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 256Mi}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: diag-pod
+  namespace: kuberselfheal
+spec:
+  selector:
+    matchLabels:
+      app: diag-pod
+  template:
+    metadata:
+      labels:
+        app: diag-pod
+    spec:
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: netshoot
+          image: nicolaka/netshoot:v0.13
+          command: ["sh", "-c", "iperf3 -s -p 5201 & exec sleep infinity"]
+          securityContext:
+            capabilities:
+              add: ["NET_RAW", "NET_ADMIN"]
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 256Mi}

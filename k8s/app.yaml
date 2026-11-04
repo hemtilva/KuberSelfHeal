@@ -1,0 +1,157 @@
+# Two-pod test app: Postgres on one worker Pi, Flask backend on the other,
+# so every request to the backend crosses between the two workers.
+#
+# Before applying, label the two worker Pis:
+#   kubectl label node <db-pi-name>      role=database
+#   kubectl label node <backend-pi-name> role=backend
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+type: Opaque
+stringData:
+  POSTGRES_DB: appdb
+  POSTGRES_USER: postgres_user
+  POSTGRES_PASSWORD: password
+---
+# Runs once on first DB start: creates the table and stores "hello world".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init
+data:
+  init.sql: |
+    CREATE TABLE message (id INT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT INTO message (id, value) VALUES (1, 'hello world');
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+    spec:
+      nodeSelector:
+        role: database
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-secret
+          # -h 127.0.0.1 forces a TCP check. During first-start init, Postgres
+          # listens only on its Unix socket, so this stays NotReady until init
+          # has finished and the real server is accepting TCP connections.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -h 127.0.0.1 -p 5432 -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Generous on purpose: Pis are slow, and restarting the DB in the
+          # middle of an experiment would hide the fault we injected.
+          livenessProbe:
+            tcpSocket:
+              port: postgres
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: init
+          configMap:
+            name: db-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-service
+spec:
+  selector:
+    app: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      nodeSelector:
+        role: backend
+      containers:
+        - name: backend
+          image: backend-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 5000
+          envFrom:
+            - secretRef:
+                name: postgres-secret
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          # Both probes check only the backend process, NOT the database.
+          # If readiness depended on the DB, a cross-node fault would pull the
+          # backend out of its Service and the prober would only see "backend
+          # unreachable", losing the DB error message that says which layer broke.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  type: NodePort
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
+      nodePort: 30080

@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# ad-hoc prober output (baseline/results/ IS committed: it's the reference data)
+probes*.jsonl
