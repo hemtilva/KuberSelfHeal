@@ -12,7 +12,18 @@ app/        Flask backend (Dockerfile, app.py)
 k8s/        app.yaml (the test app), diag.yaml (network toolbox pods on every node)
 prober/     Probes the backend continuously and records failures (JSONL)
 baseline/   collect.py records the healthy network; results/ holds the runs
+faults/     fault.sh injects / resets the faults of the current problem set
+agent/      diagnose.py: finds and labels the cause of a failed connection
+eval/       run_set1.py: injects every fault N times and scores the agent
 ```
+
+**Scope.** We work through the 60 problems one *set* at a time. The agent
+labels anything outside the current set as `other`.
+
+| Set | Layer | Problems | Status |
+|---|---|---|---|
+| 1 | Service discovery & DNS | 7, 8, 9, 12, 14 | implemented |
+| 2 | Cross-node network (firewall, MTU, routing, loss) | 2, 4, 5, 28 | next |
 
 ## 0. Cluster on a phone hotspot
 
@@ -185,6 +196,60 @@ Results go to `baseline/results/<timestamp>/`: `summary.json` plus `raw/` with e
 command and its output. **Run it at least 3 times, at different times of day and with
 the phone in its usual spot.** Hotspot Wi-Fi varies, and the agent needs to know what
 "normal" noise looks like. Commit the results.
+
+## 5. Problem set 1: Service discovery & DNS
+
+The agent follows the path the backend's connection takes, and reports the
+first broken link:
+
+```
+DB_HOST ──DNS──► Service ──selector──► Pods ──readiness──► Endpoints ──targetPort──► Postgres
+   14 / 12              7                       8                         9
+```
+
+| Label | Problem | How it's detected |
+|---|---|---|
+| `dns_coredns_down` | 14 | CoreDNS Deployment has 0 ready replicas, or `kube-dns` has no endpoints |
+| `wrong_service_name` | 12 | The Service named by the backend's `DB_HOST` doesn't exist (suggests similar names) |
+| `selector_mismatch` | 7 | The selector matches 0 pods, and no workload is meant to provide them; shows the closest labels |
+| `no_ready_endpoints` | 8 | Pods match but none are Ready (with probe events), or the workload is scaled to 0 |
+| `port_mismatch` | 9 | TCP to `podIP:targetPort` is **refused**, while the pod's declared port is open |
+| `other` | – | The app fails but every check above passes, so the cause is in another layer |
+| `healthy` | – | The app works and every check passes |
+
+Most checks compare Kubernetes objects (category A). The port check also runs
+an active TCP test (category C) from the diag pod on the backend's node. A
+**timeout**, as opposed to a refusal, is never labelled a port problem: it means
+packets are being dropped, which belongs to set 2.
+
+```bash
+python3 agent/diagnose.py                    # human-readable report
+python3 agent/diagnose.py --json             # for scripts
+```
+
+**Inject a fault by hand** (all `kubectl`, nothing touches `wlan0`):
+
+```bash
+bash faults/fault.sh list
+bash faults/fault.sh inject port
+python3 agent/diagnose.py                    # -> port_mismatch (problem 9)
+bash faults/fault.sh reset                   # undoes any fault
+```
+
+`netpol` is a fault *outside* set 1. It checks that the agent says `other`
+rather than guessing a set-1 label.
+
+**Score the agent:**
+
+```bash
+python3 eval/run_set1.py --rounds 3          # ~8 faults × 3 rounds, about 20–30 min
+```
+
+Each trial injects the fault, waits, diagnoses (and times it), resets, and waits
+until the cluster is healthy again. It also runs `none` trials, with no fault
+injected, to count false alarms. The script prints a confusion matrix, accuracy,
+per-fault results, and diagnosis time, and saves everything to
+`eval/results/<timestamp>/`. That's the results table for the report.
 
 ## Design notes
 

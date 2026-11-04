@@ -1,0 +1,36 @@
+$ echo '## link'; ip -o link; echo '## addr'; ip -o -4 addr; echo '## route'; ip route; echo '## flannel'; ip -d link show flannel.1; echo '## wireless'; cat /proc/net/wireless; echo '## conntrack'; cat /proc/sys/net/netfilter/nf_conntrack_count /proc/sys/net/netfilter/nf_conntrack_max
+[exit 0]
+## link
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc fq_codel state DOWN mode DEFAULT group default qlen 1000\    link/ether 2c:cf:67:ee:38:2f brd ff:ff:ff:ff:ff:ff
+3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DORMANT group default qlen 1000\    link/ether 2c:cf:67:ee:38:30 brd ff:ff:ff:ff:ff:ff
+4: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UNKNOWN mode DEFAULT group default \    link/ether e2:2e:3a:4d:2d:e5 brd ff:ff:ff:ff:ff:ff
+5: cni0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UP mode DEFAULT group default qlen 1000\    link/ether 6a:4c:cb:11:c8:77 brd ff:ff:ff:ff:ff:ff
+6: veth89162e67@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP mode DEFAULT group default \    link/ether 12:54:23:4f:9b:d9 brd ff:ff:ff:ff:ff:ff link-netnsid 0
+9: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN mode DEFAULT group default \    link/ether 02:42:6a:9e:ec:21 brd ff:ff:ff:ff:ff:ff
+12: vethc0e3ac33@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP mode DEFAULT group default \    link/ether 5a:f0:cc:0e:17:a2 brd ff:ff:ff:ff:ff:ff link-netnsid 1
+13: veth79d3a250@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue master cni0 state UP mode DEFAULT group default \    link/ether 9a:4c:76:07:d3:b4 brd ff:ff:ff:ff:ff:ff link-netnsid 2
+## addr
+1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+3: wlan0    inet 10.206.185.184/24 brd 10.206.185.255 scope global dynamic noprefixroute wlan0\       valid_lft 3329sec preferred_lft 3329sec
+4: flannel.1    inet 10.42.2.0/32 scope global flannel.1\       valid_lft forever preferred_lft forever
+5: cni0    inet 10.42.2.1/24 brd 10.42.2.255 scope global cni0\       valid_lft forever preferred_lft forever
+9: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0\       valid_lft forever preferred_lft forever
+## route
+default via 10.206.185.122 dev wlan0 proto dhcp src 10.206.185.184 metric 600 
+10.42.0.0/24 via 10.42.0.0 dev flannel.1 onlink 
+10.42.1.0/24 via 10.42.1.0 dev flannel.1 onlink 
+10.42.2.0/24 dev cni0 proto kernel scope link src 10.42.2.1 
+10.206.185.0/24 dev wlan0 proto kernel scope link src 10.206.185.184 metric 600 
+172.17.0.0/16 dev docker0 proto kernel scope link src 172.17.0.1 linkdown 
+## flannel
+4: flannel.1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1450 qdisc noqueue state UNKNOWN mode DEFAULT group default 
+    link/ether e2:2e:3a:4d:2d:e5 brd ff:ff:ff:ff:ff:ff promiscuity 0 allmulti 0 minmtu 68 maxmtu 65535 
+    vxlan id 1 local 10.206.185.184 dev wlan0 srcport 0 0 dstport 8472 ttl auto ageing 300 nolearning addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 tso_max_size 65536 tso_max_segs 65535 gro_max_size 65536 gso_ipv4_max_size 65536 gro_ipv4_max_size 65536 
+## wireless
+Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
+ face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
+ wlan0: 0000   63.  -47.  -256        0      0      0      8      0        0
+## conntrack
+74
+131072

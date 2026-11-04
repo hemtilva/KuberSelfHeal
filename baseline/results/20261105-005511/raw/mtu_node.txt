@@ -1,0 +1,13 @@
+path MTU search to 10.206.185.245: (payload size, passed)
+500	True
+986	True
+1229	True
+1351	True
+1412	True
+1442	True
+1457	True
+1465	True
+1469	True
+1471	True
+1472	True
+result: 1500
