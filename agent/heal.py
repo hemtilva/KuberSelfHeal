@@ -130,6 +130,8 @@ class Healer:
                     exc = RuntimeError(f"{exc} (the {len(ran)} step(s) already applied were undone)")
                 except Exception as undo_exc:
                     exc = RuntimeError(f"{exc}; undoing the applied steps ALSO failed: {undo_exc}")
+            elif ran:  # removals stay removed, but say so: the step is not in the report otherwise
+                exc = RuntimeError(f"{exc} (already applied and kept: {'; '.join(done)})")
             raise exc
         return "; ".join(done)
 

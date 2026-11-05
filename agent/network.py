@@ -153,8 +153,8 @@ class NetworkChecks:
         # 4. The tunnel is fine. If the DB pod itself doesn't answer, something at the pod
         #    blocks it (e.g. a NetworkPolicy): not a set-2 problem, so a clue for `other`.
         if len(self.d.findings) == n_findings and probe != dst:
-            rc, _ = self.in_pod(f"ping -c 3 -i 0.2 -W 1 {dst}", timeout=15)
-            if rc != 0:
+            _, out = self.in_pod(f"ping -c 3 -i 0.2 -W 1 {dst}", timeout=15)
+            if parse_ping(out).get("loss_pct") == 100.0:  # a failed exec is not "no answer"
                 self.d.other_evidence.append(
                     f"the pod tunnel to {server_node} works ({probe} answers), but the DB pod {dst} "
                     "does not answer ping: traffic is blocked at the DB pod itself "

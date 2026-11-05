@@ -114,6 +114,25 @@ def is_ready(pod):
                for c in pod.get("status", {}).get("conditions", []))
 
 
+def near_miss(selector, labels):
+    """(score, corrected selector) if `labels` look like what `selector` was meant to match, else None.
+
+    Each selector pair k=v is matched to the pod label k2=v2 whose key AND value are both
+    similar (>= NEAR_MISS): app=databse ~ app=database (value typo), ap=database ~ app=database
+    (key typo). A pair with no counterpart is an extra key on the selector and is dropped
+    from the fix. A pod is NOT a near miss if a pair has the same key but a dissimilar value
+    (app=database vs app=backend: 0.40) - that pod is something else - or if nothing matched."""
+    sim = lambda a, b: difflib.SequenceMatcher(None, a, b).ratio()
+    score, fixed = 0.0, {}
+    for k, v in selector.items():
+        best = max(((min(sim(k, k2), sim(v, v2)), k2, v2) for k2, v2 in labels.items()), default=None)
+        if best and best[0] >= NEAR_MISS:
+            score, fixed[best[1]] = score + best[0], best[2]
+        elif k in labels:
+            return None  # same key, different thing
+    return (score, fixed) if fixed else None
+
+
 def parse_host(host, default_ns):
     """DB_HOST -> (service, namespace), or None for an IP / external name."""
     try:
@@ -345,14 +364,9 @@ class Diagnoser:
         ns, name = svc["metadata"]["namespace"], svc["metadata"]["name"]
         near = {}  # label set -> (score, a pod with it); replicas of one workload count once
         for p in candidates:
-            labels = p["metadata"].get("labels", {})
-            if not all(k in labels for k in selector):
-                continue
-            ratios = [difflib.SequenceMatcher(None, v, labels[k]).ratio() for k, v in selector.items()]
-            if min(ratios) < NEAR_MISS:  # app=backend vs app=database is 0.40: not a typo of it
-                continue
-            want = {k: labels[k] for k in selector}
-            near.setdefault(json.dumps(want, sort_keys=True), (sum(ratios), p["metadata"]["name"], want))
+            m = near_miss(selector, p["metadata"].get("labels", {}))
+            if m:
+                near.setdefault(json.dumps(m[1], sort_keys=True), (m[0], p["metadata"]["name"], m[1]))
         near = sorted(near.values(), key=lambda n: -n[0])
         if not near and not wrong_target:
             self.other_evidence += [headline, "no pod has labels similar to the selector, and no workload's "
