@@ -211,7 +211,7 @@ DB_HOST ──DNS──► Service ──selector──► Pods ──readiness�
 |---|---|---|
 | `dns_coredns_down` | 14 | CoreDNS Deployment has 0 ready replicas, or `kube-dns` has no endpoints |
 | `wrong_service_name` | 12 | The Service named by the backend's `DB_HOST` doesn't exist (suggests similar names) |
-| `selector_mismatch` | 7 | The selector matches 0 pods, and no workload is meant to provide them; shows the closest labels |
+| `selector_mismatch` | 7 | The selector matches no pods but a pod with near-identical labels exists (a typo, e.g. `app=databse`), or it matches only the backend itself. If nothing similar exists, the database is missing: that is `other`, not a selector problem |
 | `no_ready_endpoints` | 8 | Pods match but none are Ready (with probe events), or the workload is scaled to 0 |
 | `port_mismatch` | 9 | `targetPort` is not a port the pod declares, **and** TCP to it is refused while a declared port is open |
 | `other` | – | The app fails but every check above passes, so the cause is in another layer; or the diagnosis itself could not finish (API unreachable, `kubectl` error) |

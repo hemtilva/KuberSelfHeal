@@ -55,6 +55,7 @@ LABELS = {  # label -> problem number from the 60-problem list
     "selector_mismatch": 7, "no_ready_endpoints": 8, "port_mismatch": 9, "other": None,
     "overlay_blocked": 4, "route_missing": 2, "mtu_blackhole": 5, "packet_loss": 28, "high_latency": 27,
 }
+NEAR_MISS = 0.6  # label-value similarity for "the selector was meant to match this pod" (typo: 0.93)
 
 
 class Kube:
@@ -296,6 +297,13 @@ class Diagnoser:
                 if not p["metadata"].get("deletionTimestamp")]
         selected = [p for p in pods if matches(selector, p["metadata"].get("labels", {}))]
         sel_txt = ",".join(f"{k}={v}" for k, v in selector.items())
+        is_client = lambda p: bool(self.client_labels) and matches(self.client_labels, p["metadata"].get("labels", {}))
+        if selected and all(is_client(p) for p in selected) and name != self.client_service:
+            # The DB Service selects the backend itself. Without this, the port check would
+            # see "5432 refused, 5000 open" on the backend pod and call it port_mismatch.
+            return self.selector_mismatch(svc, selector, sel_txt, [p for p in pods if not is_client(p)],
+                                          f"Service {name} selector {sel_txt} matches only the client "
+                                          f"({self.client_deploy}) itself, not the database", wrong_target=True)
         if selected:
             self.check("selector", True, f"selector {sel_txt} matches {len(selected)} pod(s)")
             return selected
@@ -326,31 +334,45 @@ class Diagnoser:
                               else f"kubectl -n {ns} describe {kind}/{wname}", action)
                     return None
 
-        evidence = [f"Service {name} selector {sel_txt} matches 0 of {len(pods)} pods in '{ns}'"]
-        # Near misses: pods that have the selector's keys but different values,
-        # most similar first (app=databse is closer to app=database than to app=backend).
-        near = []
-        for p in pods:
+        return self.selector_mismatch(svc, selector, sel_txt, [p for p in pods if not is_client(p)],
+                                      f"Service {name} selector {sel_txt} matches 0 of {len(pods)} pods in '{ns}'")
+
+    def selector_mismatch(self, svc, selector, sel_txt, candidates, headline, wrong_target=False):
+        """A selector that matches nothing is selector_mismatch only if a pod exists that it was
+        clearly MEANT to match (same keys, similar values: app=databse ~ app=database). No such pod
+        means the database itself is missing, which is not a selector problem: evidence for `other`.
+        A selector that matches the wrong pods (wrong_target) is a mismatch either way."""
+        ns, name = svc["metadata"]["namespace"], svc["metadata"]["name"]
+        near = {}  # label set -> (score, a pod with it); replicas of one workload count once
+        for p in candidates:
             labels = p["metadata"].get("labels", {})
             if not all(k in labels for k in selector):
                 continue
-            score = sum(difflib.SequenceMatcher(None, v, labels[k]).ratio() for k, v in selector.items())
-            near.append((score, p["metadata"]["name"], {k: labels[k] for k in selector}))
-        near.sort(key=lambda n: -n[0])
-        for _, pname, labels in near[:3]:
-            evidence.append(f"pod {pname} has {','.join(f'{k}={v}' for k, v in labels.items())}")
-        fix = (f"kubectl -n {ns} patch svc {name} --type=merge -p "
-               f"'{json.dumps({'spec': {'selector': near[0][2]}})}'"
-               if near else f"set the selector of Service {name} to the labels of the intended pods")
-        # Auto-fix only with a clear winner: the best near miss must beat the runner-up,
-        # and must not be the client itself (the Service would then point at the backend).
-        client_labels = self.client_labels or {}
-        clear = (near and (len(near) == 1 or near[0][0] > near[1][0])
-                 and not matches(near[0][2], client_labels))
-        action = ({"type": "patch_selector", "ns": ns, "svc": name, "selector": near[0][2],
+            ratios = [difflib.SequenceMatcher(None, v, labels[k]).ratio() for k, v in selector.items()]
+            if min(ratios) < NEAR_MISS:  # app=backend vs app=database is 0.40: not a typo of it
+                continue
+            want = {k: labels[k] for k in selector}
+            near.setdefault(json.dumps(want, sort_keys=True), (sum(ratios), p["metadata"]["name"], want))
+        near = sorted(near.values(), key=lambda n: -n[0])
+        if not near and not wrong_target:
+            self.other_evidence += [headline, "no pod has labels similar to the selector, and no workload's "
+                                    "template matches it: the database workload itself seems to be missing"]
+            self.check("selector", False, f"{headline}; nothing similar exists (not a selector typo)")
+            return None
+        evidence = [headline] + [f"pod {pname} has {','.join(f'{k}={v}' for k, v in labels.items())}"
+                                 for _, pname, labels in near[:3]]
+        # Auto-fix only with a clear winner: one label set that beats every other.
+        clear = len(near) == 1 or (len(near) > 1 and near[0][0] > near[1][0])
+        if not near:
+            evidence.append("no pod has labels similar to the selector: not fixing automatically")
+        elif not clear:
+            evidence.append("several pods are equally close: not fixing automatically")
+        self.find("selector_mismatch", "high", f"Service {name}'s selector doesn't match the database pods",
+                  evidence, f"kubectl -n {ns} patch svc {name} --type=merge -p "
+                            f"'{json.dumps({'spec': {'selector': near[0][2]}})}'" if near
+                            else f"set the selector of Service {name} to the database pods' labels",
+                  {"type": "patch_selector", "ns": ns, "svc": name, "selector": near[0][2],
                    "previous": selector} if clear else None)
-        self.find("selector_mismatch", "high" if near else "medium",
-                  f"Service {name}'s selector matches no pods", evidence, fix, action)
         return None
 
     def check_endpoints(self, svc, selected):
@@ -558,16 +580,22 @@ class Diagnoser:
                               "actively rejects the traffic: a NetworkPolicy (k3s/kube-router REJECTs "
                               "denied packets) or a firewall REJECT rule (set 2 found no network cause)"}.get(hint)
             primary = {"label": "other", "confidence": "medium",
-                       "summary": "the backend cannot reach the database, but every set-1 check passed: "
-                                  "the problem is in another layer",
+                       "summary": "the backend cannot reach the database, and no implemented check "
+                                  "identifies the cause: the problem is outside the covered sets",
                        "evidence": [f"app error: {' '.join(symptom['error'].split())[:200]}", f"error type: {hint}"]
                                    + ([why] if why else []) + self.other_evidence,
                        "fix": None}
-        else:
-            primary = {"label": "healthy", "confidence": "high" if symptom else "low",
-                       "summary": "app works and all checks passed" if symptom
-                                  else "all set-1 checks passed (app not probed: no diag-pod)",
+        elif symptom and not any(c["ok"] is False for c in self.checks):
+            primary = {"label": "healthy", "confidence": "high", "summary": "app works and all checks passed",
                        "evidence": [], "fix": None}
+        else:
+            # `healthy` means the app was SEEN working. Not probed (no diag-pod, exec failed)
+            # is not evidence of health, so it is not labelled healthy.
+            primary = {"label": "other", "confidence": "low",
+                       "summary": "could not confirm the app works (not probed: no diag-pod or exec failed)"
+                                  if not symptom else "app answers, but a check failed without a finding",
+                       "evidence": [f"{c['check']}: {c['detail']}" for c in self.checks if c["ok"] is not True][:6]
+                                   + self.other_evidence, "fix": None}
         primary = {**primary, "problem": LABELS[primary["label"]]}
         return {**primary, "target": result.get("target"), "symptom": symptom,
                 "all_findings": self.findings, "checks": self.checks,

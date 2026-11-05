@@ -16,7 +16,7 @@ Safety rules:
   * every step is appended to heal_log.jsonl (audit trail)
 
 Outcomes: healthy (nothing to do) | healed | escalated (needs a human) |
-          failed (fix didn't help, rolled back) | planned (dry run) | unknown
+          failed (fix didn't help, rolled back) | planned (dry run)
 """
 
 import argparse
@@ -142,7 +142,7 @@ class Healer:
         while time.monotonic() - start < self.verify_timeout:
             last = self.diagnose()
             label = last["label"]
-            if label == "healthy" and (last.get("symptom") or {}).get("ok"):
+            if label == "healthy":
                 return "healthy", last, round(time.monotonic() - start, 1)
             if label in HEALABLE and label != fault_label:
                 changed_seen += 1
@@ -176,19 +176,15 @@ class Healer:
         fixes, waited = 0, False
         while True:
             r = self.diagnose()
-            label, symptom = r["label"], r.get("symptom")
-            if label == "healthy":
-                if symptom and symptom.get("ok"):
-                    report["outcome"] = "healed" if fixes else "healthy"
-                else:
-                    report["outcome"] = "unknown"
-                    report["reason"] = "set-1 checks pass but the app could not be probed (no diag-pod?)"
+            label = r["label"]
+            if label == "healthy":  # only ever reported when the app was seen answering
+                report["outcome"] = "healed" if fixes else "healthy"
                 break
 
             finding = r["all_findings"][0] if r["all_findings"] else None
             action = finding.get("action") if finding else None
             if label not in HEALABLE:
-                why = (f"the diagnosis could not finish ({r['summary']})" if r.get("confidence") == "low"
+                why = (f"inconclusive: {r['summary']}" if r.get("confidence") == "low"
                        else "outside the implemented problem sets, or possibly intentional "
                             "(e.g. a NetworkPolicy)")
                 report.update(outcome="escalated", reason=f"'{label}': {why} - a human must decide",

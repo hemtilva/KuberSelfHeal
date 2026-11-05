@@ -204,7 +204,9 @@ class NetworkChecks:
         steps, found = [], []
         for node in (c["client"], c["server"]):
             for line in (self.on_host(node, "iptables -S") or "").splitlines():
-                if "8472" in line and re.search(r"-j (DROP|REJECT)\b", line) and line.startswith("-A "):
+                # exactly UDP port 8472 (not 18472, not an address containing it)
+                if (line.startswith("-A ") and re.search(r"-p udp\b", line)
+                        and re.search(r"--dports? (\S+,)?8472\b", line) and re.search(r"-j (DROP|REJECT)\b", line)):
                     found.append(f"on {node}: {line}")
                     steps.append({"node": node, "cmd": "iptables " + line.replace("-A ", "-D ", 1),
                                   "undo": "iptables " + line.replace("-A ", "-I ", 1)})
@@ -215,8 +217,38 @@ class NetworkChecks:
                         {"type": "node_cmd", "rollback": False, "steps": steps})
             return
         self.d.check("firewall", True, "no rule drops or rejects UDP 8472 on either node")
-        self.d.other_evidence += evidence + ["routes and firewall look correct: check flannel on both nodes "
-                                             "(ip -d link show flannel.1, k3s agent logs)"]
+
+        # c) extreme shaping: ~100% netem loss, or a delay longer than ping's 1 s timeout,
+        #    also looks like a dead tunnel. That is still loss / latency, not `other`.
+        for label, causes in (("packet_loss", "loss"), ("high_latency", "delay")):
+            found, steps = self.netem_rules(causes)
+            if steps:
+                self.d.find(label, "high", f"the pod path is unusable ({c['pod_ping'].get('loss_pct')}% of pings "
+                                           f"lost), caused by a traffic-control (netem) {causes} rule",
+                            evidence + found, "; ".join(f"on {s['node']}: {s['cmd']}" for s in steps),
+                            {"type": "node_cmd", "rollback": False, "steps": steps})
+                return
+        self.d.other_evidence += evidence + ["routes, firewall and traffic control look correct: check flannel "
+                                             "on both nodes (ip -d link show flannel.1, k3s agent logs)"]
+
+    def netem_rules(self, causes):
+        """(evidence, fix steps) for netem rules on either node that produce `causes`
+        ('loss' or 'delay'). A rule without it doesn't explain the symptom: reported, not removed."""
+        c, evidence, steps = self.ctx, [], []
+        for node in (c["client"], c["server"]):
+            for line in (self.on_host(node, "tc qdisc show") or "").splitlines():
+                m = re.search(r"qdisc netem \S+ dev (\S+) root .*?limit \d+\s*(.*)$", line)
+                if not m:
+                    continue
+                dev, params = m.group(1), m.group(2).strip()
+                if not re.search(rf"\b{causes}\b", params):
+                    evidence.append(f"on {node}: netem rule on {dev} ({params}) has no {causes}: "
+                                    "not the cause, left alone")
+                    continue
+                evidence.append(f"on {node}: traffic-control rule on {dev}: netem {params}")
+                steps.append({"node": node, "cmd": f"tc qdisc del dev {dev} root",
+                              "undo": f"tc qdisc add dev {dev} root netem {params}"})
+        return evidence, steps
 
     # --- loss / latency: shaping rule (config) or physical link? ---
 
@@ -225,22 +257,9 @@ class NetworkChecks:
         evidence = [headline,
                     f"node -> node (outside the tunnel): {c['node_ping'].get('loss_pct')}% loss, "
                     f"{c['node_ping'].get('rtt_avg_ms')} ms"]
-        steps = []
-        # Only a netem rule that produces THIS symptom is the cause: a delay-only rule
-        # doesn't explain packet loss (and vice versa), so it's reported but not removed.
         causes = "loss" if label == "packet_loss" else "delay"
-        for node in (c["client"], c["server"]):
-            for line in (self.on_host(node, "tc qdisc show") or "").splitlines():
-                m = re.search(r"qdisc netem \S+ dev (\S+) root .*?limit \d+\s*(.*)$", line)
-                if m:
-                    dev, params = m.group(1), m.group(2).strip()
-                    if not re.search(rf"\b{causes}\b", params):
-                        evidence.append(f"on {node}: netem rule on {dev} ({params}) has no {causes}: "
-                                        "not the cause, left alone")
-                        continue
-                    evidence.append(f"on {node}: traffic-control rule on {dev}: netem {params}")
-                    steps.append({"node": node, "cmd": f"tc qdisc del dev {dev} root",
-                                  "undo": f"tc qdisc add dev {dev} root netem {params}"})
+        found, steps = self.netem_rules(causes)
+        evidence += found
         what = "packet loss" if label == "packet_loss" else "latency"
         if steps:
             self.d.find(label, "high", f"high {what} on the pod path, caused by a traffic-control (netem) rule",
@@ -258,7 +277,8 @@ class NetworkChecks:
     def check_mtu(self):
         c = self.ctx
         base_mtu = int(c["base"]["path_mtu"])
-        if self.df_ping_ok(c["probe"], base_mtu - 28):
+        # Two tries: 3 lost pings on Wi-Fi must not look like "too big".
+        if self.df_ping_ok(c["probe"], base_mtu - 28) or self.df_ping_ok(c["probe"], base_mtu - 28):
             self.d.check("mtu", True, f"{base_mtu}-byte packets (DF) pass pod -> pod, as in the baseline")
             return
         lo, hi = 500, base_mtu - 28 - 1
