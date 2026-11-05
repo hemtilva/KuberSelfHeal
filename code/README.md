@@ -303,7 +303,7 @@ diagnose ──► safe, unambiguous fix? ──no──► escalate to a human 
 
 Safety rules: act only on a `high`-confidence diagnosis of a covered fault with an
 unambiguous fix; one change at a time; "fixed" means the app answers again,
-not that `kubectl` succeeded; undo the change if the app does not answer again, whatever the new diagnosis (so the cluster ends up working or as it was); give
+not that `kubectl` succeeded; if the run ends without a working app, undo every change it made, newest first (so the cluster ends up working or as it was); give
 young pods a grace period before rolling back. Every run is appended to
 `heal_log.jsonl`.
 

@@ -11,7 +11,8 @@ Safety rules:
   * never touches "other" (e.g. a NetworkPolicy may be intentional security)
   * one change at a time, each verified: "fixed" means the app really answers
     again (HTTP 200 through the backend), not just that kubectl succeeded
-  * if the app does not answer after --verify-timeout, the change is undone, whatever
+  * if the run ends without a working app (timeout, no safe next fix, too many fixes,
+    an error), EVERY change it made is undone, newest first, whatever
     the diagnosis says now: the cluster ends up working or as we found it (a fix that
     removed a faulty rule/route/qdisc is kept: undoing it would re-create the fault)
   * young not-ready pods get a grace period (they may simply still be starting)
@@ -160,6 +161,7 @@ class Healer:
     def heal(self, max_fixes=3):
         t0 = time.monotonic()
         report = {"started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "steps": [], "outcome": None}
+        self.applied = []  # (step, action) of every change made in this run, in order
         try:
             self._heal(report, max_fixes)
         except Exception as exc:
@@ -167,6 +169,10 @@ class Healer:
             # stop changing things and hand over to a human, with what was done so far.
             report.update(outcome="escalated", reason="healing stopped by an error: "
                           + f"{type(exc).__name__}: {' '.join(str(exc).split())}"[:300])
+        if report["outcome"] not in ("healed", "healthy", "planned") and self.applied:
+            # The run ends without a working app: undo EVERY change it made, newest first,
+            # not just the last one, so the cluster is left as we found it.
+            report["reason"] = (report.get("reason") or "") + "; " + self.undo_all()
 
         report["total_s"] = round(time.monotonic() - t0, 1)
         report["mttr_s"] = (round(sum(s.get("fix_to_ok_s", 0) for s in report["steps"]), 1)
@@ -175,6 +181,28 @@ class Healer:
             with open(REPO / "heal_log.jsonl", "a", encoding="utf-8") as log:
                 log.write(json.dumps(report) + "\n")
         return report
+
+    def undo_all(self):
+        """Undo every applied change, newest first (best effort). Returns a one-line summary."""
+        undone, kept, errors = 0, 0, []
+        for step, action in reversed(self.applied):
+            undo = inverse(action)
+            if not undo:
+                if action["type"] == "node_cmd":  # removed a faulty rule/route/qdisc
+                    step["kept"] = "fix kept: it removed a faulty rule/route, so undoing it would re-create the fault"
+                    kept += 1
+                continue
+            try:
+                self.say(f"undoing: {step['label']}")
+                step["rolled_back"] = self.apply(undo)
+                undone += 1
+            except Exception as exc:  # keep going: undo as much as possible
+                step["rollback_error"] = " ".join(str(exc).split())[:200]
+                errors.append(step["label"])
+        parts = [f"{undone} change(s) undone"] + ([f"{kept} removal(s) of a faulty rule kept"] if kept else [])
+        if errors:
+            parts.append(f"UNDO FAILED for {', '.join(errors)}: check by hand")
+        return ", ".join(parts)
 
     def _heal(self, report, max_fixes):
         fixes, waited = 0, False
@@ -229,6 +257,7 @@ class Healer:
             step["command"] = self.apply(action)
             fixes += 1
             report["steps"].append(step)  # recorded now, so a later error can't hide the change
+            self.applied.append((step, action))
             status, after, secs = self.verify(label)
             # fix_to_ok_s: from the fix command until the app answers (includes the rollout wait)
             step.update(verify=status, verify_s=secs, fix_to_ok_s=round(time.monotonic() - t_fix, 1),
@@ -237,24 +266,16 @@ class Healer:
 
             if status == "timeout":
                 # The app does not answer after the fix. Whatever the diagnosis says now (the same
-                # fault, `other`, or nothing usable), the change did not help, and it may have made
-                # things worse (e.g. pointed the Service at the wrong port): undo it, so the cluster
-                # is left either working or exactly as we found it. Only a fix that removed a faulty
-                # rule/route/qdisc is kept, because undoing it would re-create a fault.
+                # fault, `other`, or nothing usable), the changes did not help and may have made
+                # things worse (e.g. pointed the Service at the wrong port). heal() undoes every
+                # change of this run, so the cluster is left either working or as we found it.
                 now = after["label"] if after else "unknown"
-                undo = inverse(action)
-                if undo:
-                    self.say(f"the app still does not answer (now: {now}): undoing the change")
-                    step["rolled_back"] = self.apply(undo)
-                elif action["type"] == "node_cmd":
-                    step["kept"] = "fix kept: it removed a faulty rule/route, so undoing it would re-create the fault"
-                done = "change undone" if undo else "change kept" if step.get("kept") else "nothing to undo"
                 if now == label:
-                    report.update(outcome="failed", reason=f"{label} persisted {secs} s after the fix ({done})",
+                    report.update(outcome="failed", reason=f"{label} persisted {secs} s after the fix",
                                   diagnosis=summary(after))
                 else:
                     report.update(outcome="escalated",
-                                  reason=f"the fix for {label} did not bring the app back (now: {now}; {done})",
+                                  reason=f"the fix for {label} did not bring the app back (now: {now})",
                                   diagnosis=summary(after) if after else None)
                 break
             # 'healthy' or 'changed' -> loop: the next diagnosis decides

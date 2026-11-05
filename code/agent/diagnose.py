@@ -271,7 +271,15 @@ class Diagnoser:
         eps = [e for s in self.k.items("-n", "kube-system", "get", "endpointslices",
                                        "-l", "kubernetes.io/service-name=kube-dns")
                for e in s.get("endpoints") or [] if e.get("conditions", {}).get("ready") is not False]
-        if ready == 0 or not eps:
+        if ready > 0 and not eps:
+            # CoreDNS itself runs, but the kube-dns Service has no endpoints (e.g. its selector
+            # is broken). That is not "CoreDNS is down", and restarting CoreDNS cannot fix it.
+            # (Right after CoreDNS is scaled up this is also briefly true while endpoints catch up.)
+            self.other_evidence.append(f"CoreDNS has {ready}/{desired} ready pods, but the kube-dns Service "
+                                       "has no ready endpoints: the Service or its endpoints are broken, "
+                                       "not CoreDNS (not covered)")
+            self.check("coredns", False, f"{ready}/{desired} CoreDNS pods ready, but kube-dns has 0 endpoints")
+        elif ready == 0:
             if desired == 0:
                 action = {"type": "scale", "ns": "kube-system", "kind": "deploy", "name": "coredns",
                           "replicas": 1, "previous": 0}
@@ -417,6 +425,17 @@ class Diagnoser:
         elif not self.serves_service_port(svc, near[0][4]):
             evidence.append(f"pod {near[0][1]} does not serve the Service's target port: not fixing automatically")
             clear = False
+        else:
+            # The corrected selector must pick only pods of the chosen label set. Dropping a key
+            # (tier=db) can widen it to pods that were rejected as something else (tier=replica).
+            fixed = near[0][2]
+            extra = [p["metadata"]["name"] for p in candidates
+                     if matches(fixed, p["metadata"].get("labels", {}))
+                     and (near_miss(selector, p["metadata"].get("labels", {})) or (0, None))[1] != fixed]
+            if extra:
+                evidence.append(f"the corrected selector would also pick {', '.join(extra[:3])}: "
+                                "not fixing automatically")
+                clear = False
         self.find("selector_mismatch", "high", f"Service {name}'s selector doesn't match the database pods",
                   evidence, f"kubectl -n {ns} patch svc {name} --type=merge -p "
                             f"'{json.dumps({'spec': {'selector': near[0][2]}})}'" if near
