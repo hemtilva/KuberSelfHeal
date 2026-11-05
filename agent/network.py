@@ -86,7 +86,12 @@ class NetworkChecks:
             addrs = {a["type"]: a["address"] for a in n["status"]["addresses"]}
             nodes[n["metadata"]["name"]] = {"ip": addrs.get("InternalIP"), "cidr": n["spec"].get("podCIDR")}
         base = load_baseline()
-        self.ctx = {"client": client_node, "server": server_node, "dst": dst, "nodes": nodes, "base": base}
+        # Test the tunnel against the diag-pod on the DB's node, not the DB pod itself: a
+        # NetworkPolicy on the DB pod would otherwise look exactly like a broken tunnel. It is
+        # also what the baseline measured (diag-pod -> diag-pod). The DB pod is checked last.
+        peer = (self.diag("diag-pod", server_node) or {}).get("status", {}).get("podIP")
+        self.ctx = {"client": client_node, "server": server_node, "dst": dst, "probe": peer or dst,
+                    "nodes": nodes, "base": base}
 
         # 1. Underlay: can the two Pis reach each other at all (over Wi-Fi)?
         node_ping = parse_ping(self.on_host(client_node, f"ping -c 5 -i 0.2 -W 1 {nodes[server_node]['ip']}") or "")
@@ -100,7 +105,8 @@ class NetworkChecks:
                                        f"{node_ping.get('rtt_avg_ms')} ms")
 
         # 2. Overlay: pod to pod across the VXLAN tunnel.
-        _, out = self.in_pod(f"ping -c 30 -i 0.1 -W 1 {dst}", timeout=40)
+        probe = self.ctx["probe"]
+        _, out = self.in_pod(f"ping -c 30 -i 0.1 -W 1 {probe}", timeout=40)
         pod_ping = parse_ping(out)
         self.ctx["pod_ping"] = pod_ping
         loss, rtt = pod_ping.get("loss_pct"), pod_ping.get("rtt_avg_ms")
@@ -116,7 +122,7 @@ class NetworkChecks:
                     (r is not None and r > base["rtt_avg_ms"] + LATENCY_EXTRA_MS and r > 2 * base["rtt_avg_ms"]))
         if bad(loss, rtt):
             # One ~3 s burst can hit a momentary hotspot stall: confirm with a second sample.
-            _, out2 = self.in_pod(f"ping -c 30 -i 0.1 -W 1 {dst}", timeout=40)
+            _, out2 = self.in_pod(f"ping -c 30 -i 0.1 -W 1 {probe}", timeout=40)
             p2 = parse_ping(out2)
             if p2.get("loss_pct") is not None and not bad(p2["loss_pct"], p2.get("rtt_avg_ms")):
                 self.d.check("overlay", True, f"first sample looked bad ({loss}% loss, {rtt} ms) but a second "
@@ -138,7 +144,18 @@ class NetworkChecks:
                                       f"(baseline {base['loss_pct']}%, {base['rtt_avg_ms']} ms)")
 
         # 3. MTU: do full-size packets still fit through the tunnel?
+        n_findings = len(self.d.findings)
         self.check_mtu()
+
+        # 4. The tunnel is fine. If the DB pod itself doesn't answer, something at the pod
+        #    blocks it (e.g. a NetworkPolicy): not a set-2 problem, so a clue for `other`.
+        if len(self.d.findings) == n_findings and probe != dst:
+            rc, _ = self.in_pod(f"ping -c 3 -i 0.2 -W 1 {dst}", timeout=15)
+            if rc != 0:
+                self.d.other_evidence.append(
+                    f"the pod tunnel to {server_node} works ({probe} answers), but the DB pod {dst} "
+                    "does not answer ping: traffic is blocked at the DB pod itself "
+                    "(e.g. a NetworkPolicy), not in the cross-node network")
 
     # --- overlay completely down: route or firewall? ---
 
@@ -227,16 +244,16 @@ class NetworkChecks:
     def check_mtu(self):
         c = self.ctx
         base_mtu = int(c["base"]["path_mtu"])
-        if self.df_ping_ok(c["dst"], base_mtu - 28):
+        if self.df_ping_ok(c["probe"], base_mtu - 28):
             self.d.check("mtu", True, f"{base_mtu}-byte packets (DF) pass pod -> pod, as in the baseline")
             return
         lo, hi = 500, base_mtu - 28 - 1
-        if not self.df_ping_ok(c["dst"], lo):
+        if not self.df_ping_ok(c["probe"], lo):
             self.d.check("mtu", None, "even 528-byte DF packets fail: not an MTU problem")
             return
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if self.df_ping_ok(c["dst"], mid):
+            if self.df_ping_ok(c["probe"], mid):
                 lo = mid
             else:
                 hi = mid - 1

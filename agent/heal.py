@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Self-heal problem set 1: diagnose -> fix -> verify -> roll back if it didn't help.
+"""Self-heal problem sets 1 and 2: diagnose -> fix -> verify -> roll back if it didn't help.
 
     python3 agent/heal.py              # heal for real
     python3 agent/heal.py --dry-run    # only show what it would do
     python3 agent/heal.py --json       # machine-readable (used by eval/run_heal.py)
 
 Safety rules:
-  * acts only on a set-1 label, with confidence "high", AND a structured action
+  * acts only on a set-1/set-2 label, with confidence "high", AND a structured action
     from the diagnosis (diagnose.py only attaches one when the fix is unambiguous)
   * never touches "other" (e.g. a NetworkPolicy may be intentional security)
   * one change at a time, each verified: "fixed" means the app really answers
@@ -107,17 +107,30 @@ class Healer:
 
     def apply_node_cmd(self, action):
         """Run shell commands on nodes' host network through their diag-host pods."""
-        done = []
-        for s in action["steps"]:
-            pods = [p for p in self.k.items("-n", DIAG_NS, "get", "pods", "-l", "app=diag-host")
-                    if p["spec"].get("nodeName") == s["node"] and p["status"].get("phase") == "Running"]
-            if not pods:
-                raise RuntimeError(f"no diag-host pod on {s['node']}")
-            self.say(f"on {s['node']}: {s['cmd']}")
-            rc, out, err = self.k.sh(DIAG_NS, pods[0]["metadata"]["name"], s["cmd"])
-            if rc != 0:
-                raise RuntimeError(f"on {s['node']}: {s['cmd']} failed: {(out + err).strip()[:200]}")
-            done.append(f"on {s['node']}: {s['cmd']}")
+        done, ran = [], []
+        try:
+            for s in action["steps"]:
+                pods = [p for p in self.k.items("-n", DIAG_NS, "get", "pods", "-l", "app=diag-host")
+                        if p["spec"].get("nodeName") == s["node"] and p["status"].get("phase") == "Running"]
+                if not pods:
+                    raise RuntimeError(f"no diag-host pod on {s['node']}")
+                self.say(f"on {s['node']}: {s['cmd']}")
+                rc, out, err = self.k.sh(DIAG_NS, pods[0]["metadata"]["name"], s["cmd"])
+                if rc != 0:
+                    raise RuntimeError(f"on {s['node']}: {s['cmd']} failed: {(out + err).strip()[:200]}")
+                ran.append(s)
+                done.append(f"on {s['node']}: {s['cmd']}")
+        except Exception as exc:
+            # Don't leave a half-applied change behind (e.g. an MSS clamp on one node only).
+            # Removals of a faulty rule/route (rollback False) are kept: undoing re-creates the fault.
+            if ran and action.get("rollback") is not False:
+                undo = {**inverse({**action, "steps": ran}), "rollback": False}  # no undo-of-the-undo
+                try:
+                    self.apply_node_cmd(undo)
+                    exc = RuntimeError(f"{exc} (the {len(ran)} step(s) already applied were undone)")
+                except Exception as undo_exc:
+                    exc = RuntimeError(f"{exc}; undoing the applied steps ALSO failed: {undo_exc}")
+            raise exc
         return "; ".join(done)
 
     def verify(self, fault_label):
@@ -143,6 +156,23 @@ class Healer:
     def heal(self, max_fixes=3):
         t0 = time.monotonic()
         report = {"started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "steps": [], "outcome": None}
+        try:
+            self._heal(report, max_fixes)
+        except Exception as exc:
+            # Anything unexpected (a failed kubectl/node command, the API going away):
+            # stop changing things and hand over to a human, with what was done so far.
+            report.update(outcome="escalated", reason="healing stopped by an error: "
+                          + f"{type(exc).__name__}: {' '.join(str(exc).split())}"[:300])
+
+        report["total_s"] = round(time.monotonic() - t0, 1)
+        report["mttr_s"] = (round(sum(s.get("fix_to_ok_s", 0) for s in report["steps"]), 1)
+                            if report["outcome"] == "healed" else None)
+        if not self.dry_run:
+            with open(REPO / "heal_log.jsonl", "a", encoding="utf-8") as log:
+                log.write(json.dumps(report) + "\n")
+        return report
+
+    def _heal(self, report, max_fixes):
         fixes, waited = 0, False
         while True:
             r = self.diagnose()
@@ -158,8 +188,10 @@ class Healer:
             finding = r["all_findings"][0] if r["all_findings"] else None
             action = finding.get("action") if finding else None
             if label not in HEALABLE:
-                report.update(outcome="escalated", reason=f"'{label}': outside problem set 1, "
-                              "or possibly intentional (e.g. a NetworkPolicy) - a human must decide",
+                why = (f"the diagnosis could not finish ({r['summary']})" if r.get("confidence") == "low"
+                       else "outside the implemented problem sets, or possibly intentional "
+                            "(e.g. a NetworkPolicy)")
+                report.update(outcome="escalated", reason=f"'{label}': {why} - a human must decide",
                               diagnosis=summary(r))
                 break
             if r["confidence"] != "high" or not action:
@@ -196,6 +228,7 @@ class Healer:
             t_fix = time.monotonic()
             step["command"] = self.apply(action)
             fixes += 1
+            report["steps"].append(step)  # recorded now, so a later error can't hide the change
             status, after, secs = self.verify(label)
             # fix_to_ok_s: from the fix command until the app answers (includes the rollout wait)
             step.update(verify=status, verify_s=secs, fix_to_ok_s=round(time.monotonic() - t_fix, 1),
@@ -209,25 +242,15 @@ class Healer:
                     step["rolled_back"] = self.apply(undo)
                 elif action["type"] == "node_cmd":
                     step["kept"] = "fix kept: it removed a faulty rule/route, so undoing it would re-create the fault"
-                report["steps"].append(step)
                 report.update(outcome="failed", reason=f"{label} persisted {secs} s after the fix",
                               diagnosis=summary(after))
                 break
-            report["steps"].append(step)
             if status == "timeout":
                 report.update(outcome="escalated", reason=f"fixed {label}, but the app still fails: "
                               f"{after['label'] if after else 'unknown'}",
                               diagnosis=summary(after) if after else None)
                 break
             # 'healthy' or 'changed' -> loop: the next diagnosis decides
-
-        report["total_s"] = round(time.monotonic() - t0, 1)
-        report["mttr_s"] = (round(sum(s.get("fix_to_ok_s", 0) for s in report["steps"]), 1)
-                            if report["outcome"] == "healed" else None)
-        if not self.dry_run:
-            with open(REPO / "heal_log.jsonl", "a", encoding="utf-8") as log:
-                log.write(json.dumps(report) + "\n")
-        return report
 
 
 def summary(r):

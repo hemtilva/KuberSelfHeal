@@ -483,12 +483,21 @@ class Diagnoser:
     # --- main ---
 
     def run(self):
+        """Never raises: anything unexpected (API server unreachable, kubectl timeout,
+        a malformed object, a bug) becomes the label `other`, so the healer escalates."""
         start = time.monotonic()
         result = {"target": None, "symptom": None}
+        try:
+            error = self._run(result)
+        except Exception as exc:
+            error = f"diagnosis could not complete: {type(exc).__name__}: {' '.join(str(exc).split())}"[:300]
+        return self.finish(start, result, error=error)
 
+    def _run(self, result):
+        """Fill `result`; return an error message to label the run `other`, or None."""
         client = self.k.get("-n", self.ns, "get", "deploy", self.client_deploy)
         if not client:
-            return self.finish(start, result, error=f"Deployment {self.client_deploy} not found in {self.ns}")
+            return f"Deployment {self.client_deploy} not found in {self.ns}"
         env = {e["name"]: e.get("value") for c in client["spec"]["template"]["spec"]["containers"]
                for e in c.get("env", [])}
         host, port = env.get("DB_HOST") or "db-service", int(env.get("DB_PORT") or 5432)
@@ -528,21 +537,25 @@ class Diagnoser:
                                 NetworkChecks(self).run(nodes[0] if nodes else None, ready[0])
                             except Exception as exc:  # a set-2 problem must never hide set-1 results
                                 self.check("network", None, f"set-2 checks could not run: {exc}"[:200])
-        return self.finish(start, result)
+        return None
 
     def finish(self, start, result, error=None):
         symptom = result.get("symptom")
         if error:
-            primary = {"label": "other", "confidence": "low", "summary": error, "evidence": [], "fix": None}
+            # Partial findings stay in all_findings for a human, but are not acted on:
+            # the diagnosis didn't finish, so they may not be the whole story.
+            primary = {"label": "other", "confidence": "low", "summary": error,
+                       "evidence": [f"{f['label']}: {f['summary']}" for f in self.findings] + self.other_evidence,
+                       "fix": None}
         elif self.findings:
             primary = self.findings[0]
         elif symptom and not symptom["ok"]:
             hint = symptom.get("hint")
             why = {"timeout": "timeout with a correct Service -> packets are silently dropped: "
-                              "firewall DROP (e.g. VXLAN UDP 8472), MTU or routing (later sets)",
+                              "firewall DROP (e.g. VXLAN UDP 8472), MTU or routing (set 2 found no network cause)",
                    "refused": "refused although Service, endpoints and port are correct -> something "
                               "actively rejects the traffic: a NetworkPolicy (k3s/kube-router REJECTs "
-                              "denied packets) or a firewall REJECT rule (later sets)"}.get(hint)
+                              "denied packets) or a firewall REJECT rule (set 2 found no network cause)"}.get(hint)
             primary = {"label": "other", "confidence": "medium",
                        "summary": "the backend cannot reach the database, but every set-1 check passed: "
                                   "the problem is in another layer",
