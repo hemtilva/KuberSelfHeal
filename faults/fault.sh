@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Inject / undo faults.
-#   Set 1 (Service discovery & DNS): kubectl changes only.
-#   Set 2 (cross-node network): node-level changes made through the privileged
+#   Group 1 (Kubernetes service path: discovery & DNS): kubectl changes only.
+#   Group 2 (cross-node network): node-level changes made through the privileged
 #     diag-host pod, ONLY on the overlay (flannel.1 / VXLAN UDP 8472), never on
-#     wlan0, so SSH and the Kubernetes API keep working. Each set-2 fault also
+#     wlan0, so SSH and the Kubernetes API keep working. Each group-2 fault also
 #     schedules its own undo after AUTO_REVERT seconds (default 300) as a safety net.
 #
 #   faults/fault.sh list
@@ -17,20 +17,20 @@ K=${KUBECTL:-kubectl}
 NS=${APP_NAMESPACE:-default}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 
-# fault | problem # | expected agent label | what it does
+# fault | expected agent label | what it does
 FAULTS="
-selector    7   selector_mismatch    db-service selector changed to app=databse (typo)
-scale0      8   no_ready_endpoints   database scaled to 0 replicas
-readiness   8   no_ready_endpoints   database readiness probe always fails
-port        9   port_mismatch        db-service targetPort changed 5432 -> 5433
-wrong-name  12  wrong_service_name   backend DB_HOST changed to db-svc (no such Service)
-coredns     14  dns_coredns_down     CoreDNS scaled to 0 replicas
-netpol      -   other                NetworkPolicy blocks backend->db (outside set 1, tests 'other')
-fw-vxlan    4   overlay_blocked      [set 2] DB node drops VXLAN (UDP 8472): the pod tunnel is cut
-mtu         5   mtu_blackhole        [set 2] overlay silently drops packets > 1200 bytes (MTU blackhole)
-route       2   route_missing        [set 2] backend node loses its route to the DB node's pod network
-loss        28  packet_loss          [set 2] DB node's overlay drops 40% of packets (tc netem)
-delay       27  high_latency         [set 2] DB node's overlay adds 150 ms delay (tc netem)
+selector    selector_mismatch    db-service selector changed to app=databse (typo)
+scale0      no_ready_endpoints   database scaled to 0 replicas
+readiness   no_ready_endpoints   database readiness probe always fails
+port        port_mismatch        db-service targetPort changed 5432 -> 5433
+wrong-name  wrong_service_name   backend DB_HOST changed to db-svc (no such Service)
+coredns     dns_coredns_down     CoreDNS scaled to 0 replicas
+netpol      other                NetworkPolicy blocks backend->db (not covered: tests 'other')
+fw-vxlan    overlay_blocked      [group 2] DB node drops VXLAN (UDP 8472): the pod tunnel is cut
+mtu         mtu_blackhole        [group 2] overlay silently drops packets > 1200 bytes (MTU blackhole)
+route       route_missing        [group 2] backend node loses its route to the DB node's pod network
+loss        packet_loss          [group 2] DB node's overlay drops 40% of packets (tc netem)
+delay       high_latency         [group 2] DB node's overlay adds 150 ms delay (tc netem)
 "
 
 AUTO_REVERT=${AUTO_REVERT:-300}
@@ -47,7 +47,7 @@ node_of()  { $K -n "$NS" get pod -l "app=$1" -o jsonpath='{.items[0].spec.nodeNa
 workers()  { $K get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{.items[*].metadata.name}'; }
 pod_cidr() { $K get node "$1" -o jsonpath='{.spec.podCIDR}'; }
 
-# Undo commands for set-2 faults (idempotent: safe to run when nothing is there).
+# Undo commands for group-2 faults (idempotent: safe to run when nothing is there).
 UNDO_FW='while iptables -D INPUT -p udp --dport 8472 -j DROP 2>/dev/null; do :; done'
 UNDO_MTU='for d in -i -o; do while iptables -D FORWARD $d flannel.1 -m length --length 1201:65535 -j DROP 2>/dev/null; do :; done; done'
 UNDO_TC='tc qdisc show dev flannel.1 | grep -q netem && tc qdisc del dev flannel.1 root || true'
@@ -125,7 +125,7 @@ EOF
   esac
 }
 
-# Undo every set-2 fault (and the healer's MSS clamp) on all workers.
+# Undo every group-2 fault (and the healer's MSS clamp) on all workers.
 reset_network() {
   local nodes n m cidr
   nodes=$(workers)

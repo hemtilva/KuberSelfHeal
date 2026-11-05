@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Score the agent: inject each fault, diagnose, compare, reset (problem set 1, 2 or both).
+"""Score the diagnosis: inject each fault, diagnose, compare, reset.
 
-    python3 eval/run_set1.py --set 2 --rounds 3     # set 2: cross-node network faults
+    python3 eval/run_diagnose.py --group 2 --rounds 3   # cross-node network faults
 
 Run on the control-plane Pi with the app and k8s/diag.yaml deployed:
 
-    python3 eval/run_set1.py --rounds 3
-    python3 eval/run_set1.py --rounds 1 --faults selector,port     # quick check
-    python3 eval/run_set1.py --kubectl "sudo k3s kubectl"
+    python3 eval/run_diagnose.py --rounds 3                         # group 1: Kubernetes service path
+    python3 eval/run_diagnose.py --group all --rounds 3             # both groups
+    python3 eval/run_diagnose.py --rounds 1 --faults selector,port  # quick check
+    python3 eval/run_diagnose.py --kubectl "sudo k3s kubectl"
 
 Each trial:  inject -> wait --settle s -> diagnose (timed) -> reset -> wait until healthy.
-"none" trials (no fault) measure false alarms; "netpol" is a fault OUTSIDE set 1
-that the agent should call "other".
+"none" trials (no fault) measure false alarms; "netpol" is a fault the agent does NOT
+cover: it must be called "other".
 
 Output: eval/results/<timestamp>/trials.jsonl and a confusion matrix.
 """
@@ -35,16 +36,16 @@ EXPECTED = {
     "wrong-name": "wrong_service_name",
     "coredns": "dns_coredns_down",
     "netpol": "other",
-    # set 2: cross-node network
+    # group 2: cross-node network
     "fw-vxlan": "overlay_blocked",
     "mtu": "mtu_blackhole",
     "route": "route_missing",
     "loss": "packet_loss",
     "delay": "high_latency",
 }
-SETS = {"1": ["none", "selector", "scale0", "readiness", "port", "wrong-name", "coredns", "netpol"],
+GROUPS = {"1": ["none", "selector", "scale0", "readiness", "port", "wrong-name", "coredns", "netpol"],
         "2": ["none", "fw-vxlan", "mtu", "route", "loss", "delay"]}
-SETS["all"] = SETS["1"] + SETS["2"][1:]
+GROUPS["all"] = GROUPS["1"] + GROUPS["2"][1:]
 LABEL_ORDER = ["healthy", "dns_coredns_down", "wrong_service_name", "selector_mismatch",
                "no_ready_endpoints", "port_mismatch", "overlay_blocked", "route_missing", "mtu_blackhole",
                "packet_loss", "high_latency", "other", "ERROR"]
@@ -90,20 +91,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kubectl", default="kubectl")
     ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--set", default="1", choices=list(SETS), help="which problem set to run")
-    ap.add_argument("--faults", default=None, help="comma-separated subset (overrides --set)")
+    ap.add_argument("--group", "--set", dest="group", default="1", choices=list(GROUPS),
+                    help="fault group: 1 = Kubernetes service path, 2 = cross-node network, all = both")
+    ap.add_argument("--faults", default=None, help="comma-separated subset (overrides --group)")
     ap.add_argument("--settle", type=float, default=20, help="seconds between inject and diagnose")
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
-    faults = [f.strip() for f in args.faults.split(",") if f.strip()] if args.faults else SETS[args.set]
+    faults = [f.strip() for f in args.faults.split(",") if f.strip()] if args.faults else GROUPS[args.group]
     unknown = [f for f in faults if f not in EXPECTED]
     if unknown:
         sys.exit(f"unknown fault(s): {unknown}; choose from {list(EXPECTED)}")
     rng = random.Random(args.seed)
     env = {**os.environ, "KUBECTL": args.kubectl}
 
-    outdir = REPO / "eval" / "results" / ((f"set{args.set}-" if args.set != "1" else "") + time.strftime("%Y%m%d-%H%M%S"))
+    outdir = REPO / "eval" / "results" / ((f"group{args.group}-" if args.group != "1" else "") + time.strftime("%Y%m%d-%H%M%S"))
     outdir.mkdir(parents=True)
     trials_file = outdir / "trials.jsonl"
 

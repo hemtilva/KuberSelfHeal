@@ -299,7 +299,7 @@ def main():
         if "node_network" in f:
             for label, net in nets.items():
                 if ipaddress.ip_network(f["node_network"]).overlaps(net):
-                    W.append(f"{name}: node network {f['node_network']} overlaps the {label} CIDR {net} (problem 6)")
+                    W.append(f"{name}: node network {f['node_network']} overlaps the {label} CIDR {net} (subnet clash)")
         if f.get("vxlan_local_ip") and f["vxlan_local_ip"] != nodes[name]["ip"]:
             W.append(f"{name}: VXLAN uses {f['vxlan_local_ip']} on {f.get('vxlan_dev')}, "
                      f"but node IP is {nodes[name]['ip']} (wrong --flannel-iface?)")

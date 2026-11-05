@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Self-heal problem sets 1 and 2: diagnose -> fix -> verify -> roll back if it didn't help.
+"""Self-heal the faults the agent covers: diagnose -> fix -> verify -> roll back if it didn't help.
 
     python3 agent/heal.py              # heal for real
     python3 agent/heal.py --dry-run    # only show what it would do
     python3 agent/heal.py --json       # machine-readable (used by eval/run_heal.py)
 
 Safety rules:
-  * acts only on a set-1/set-2 label, with confidence "high", AND a structured action
+  * acts only on a covered fault label (never `other`), with confidence "high", AND a structured action
     from the diagnosis (diagnose.py only attaches one when the fix is unambiguous)
   * never touches "other" (e.g. a NetworkPolicy may be intentional security)
   * one change at a time, each verified: "fixed" means the app really answers
@@ -31,7 +31,7 @@ from diagnose import Diagnoser, Kube  # noqa: E402
 REPO = Path(__file__).resolve().parent.parent
 HEALABLE = {"dns_coredns_down", "wrong_service_name", "selector_mismatch",
             "no_ready_endpoints", "port_mismatch",
-            # set 2 (healed only when the diagnosis found a configuration cause)
+            # network group (healed only when the diagnosis found a configuration cause)
             "overlay_blocked", "route_missing", "mtu_blackhole", "packet_loss", "high_latency"}
 DIAG_NS = "kuberselfheal"
 
@@ -187,7 +187,7 @@ class Healer:
             action = finding.get("action") if finding else None
             if label not in HEALABLE:
                 why = (f"inconclusive: {r['summary']}" if r.get("confidence") == "low"
-                       else "outside the implemented problem sets, or possibly intentional "
+                       else "outside the faults the agent covers, or possibly intentional "
                             "(e.g. a NetworkPolicy)")
                 report.update(outcome="escalated", reason=f"'{label}': {why} - a human must decide",
                               diagnosis=summary(r))
@@ -210,7 +210,7 @@ class Healer:
                 time.sleep(wait)
                 continue
 
-            step = {"label": label, "problem": r.get("problem"), "summary": r["summary"],
+            step = {"label": label, "summary": r["summary"],
                     "evidence": r["evidence"], "action": action}
             if self.dry_run:
                 if action["type"] == "node_cmd":
@@ -222,7 +222,7 @@ class Healer:
                 report["outcome"] = "planned"
                 break
 
-            self.say(f"diagnosis: {label} (problem {r.get('problem')}): {r['summary']}")
+            self.say(f"diagnosis: {label}: {r['summary']}")
             t_fix = time.monotonic()
             step["command"] = self.apply(action)
             fixes += 1
@@ -261,7 +261,7 @@ def print_report(rep):
     if rep.get("reason"):
         print(f"  {rep['reason']}")
     for i, s in enumerate(rep["steps"], 1):
-        print(f"\n  step {i}: {s['label']} (problem {s['problem']})")
+        print(f"\n  step {i}: {s['label']}")
         print(f"    {s['summary']}")
         if s.get("would_run"):
             print(f"    would run: {s['would_run']}")

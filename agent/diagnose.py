@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Diagnose why the backend can't reach its database: problem sets 1 and 2.
+"""Diagnose why the backend can't reach its database.
 
-Set 1 = Service discovery & DNS. The agent follows the path the backend's
-connection takes and stops at the first broken link:
+The agent covers two groups of faults and labels anything else `other`.
+
+Group 1, the Kubernetes service path (service discovery & DNS). The agent follows
+the path the backend's connection takes and stops at the first broken link:
 
     DB_HOST --DNS--> Service --selector--> Pods --readiness--> Endpoints --targetPort--> Postgres
 
 Labels:
-    healthy             the app works and no set-1 check failed
-    dns_coredns_down    (14) CoreDNS has no ready pods / kube-dns has no endpoints
-    wrong_service_name  (12) DB_HOST names a Service that doesn't exist
-    selector_mismatch   (7)  the Service's selector matches no pods
-    no_ready_endpoints  (8)  pods match, but none are Ready (or the workload is scaled to 0)
-    port_mismatch       (9)  Service port / targetPort doesn't reach the port Postgres listens on
-  set 2 (agent/network.py, runs only if every set-1 check passed):
-    overlay_blocked     (4)  a firewall rule drops the VXLAN tunnel (UDP 8472)
-    route_missing       (2)  a node has no route to the other node's pod network
-    mtu_blackhole       (5)  full-size packets vanish on the tunnel, bulk TCP stalls
-    packet_loss         (28) pod-to-pod loss far above the baseline
-    high_latency        (27) pod-to-pod RTT far above the baseline
-    other               the app fails but every set-1 and set-2 check passes
+    healthy             the app was seen answering and no check failed
+    dns_coredns_down    CoreDNS has no ready pods / kube-dns has no endpoints
+    wrong_service_name  DB_HOST names a Service that doesn't exist
+    selector_mismatch   the Service's selector doesn't match the database pods
+    no_ready_endpoints  pods match, but none are Ready (or the workload is scaled to 0)
+    port_mismatch       Service port / targetPort doesn't reach the port Postgres listens on
+  group 2, the cross-node network (agent/network.py, runs only if group 1 is fine):
+    overlay_blocked     a firewall rule drops the VXLAN tunnel (UDP 8472)
+    route_missing       a node has no route to the other node's pod network
+    mtu_blackhole       full-size packets vanish on the tunnel, bulk TCP stalls
+    packet_loss         pod-to-pod loss far above the baseline
+    high_latency        pod-to-pod RTT far above the baseline
+    other               anything the two groups don't cover: the app fails but every check passes
                         (e.g. a NetworkPolicy), the Wi-Fi itself is down, or the
                         diagnosis could not finish (API unreachable, kubectl error)
 
@@ -29,7 +31,7 @@ Run on the control-plane Pi (standard library + kubectl):
     python3 agent/diagnose.py --json          # machine-readable, used by eval/
     python3 agent/diagnose.py --kubectl "sudo k3s kubectl"
 
-Active tests (category C) run inside the diag-pod on the backend's node, so
+Active tests (ping, TCP, HTTP) run inside the diag-pod on the backend's node, so
 deploy k8s/diag.yaml first (baseline/collect.py does that). Without it the
 agent falls back to configuration checks only.
 """
@@ -50,10 +52,10 @@ sys.path.insert(0, str(REPO / "prober"))
 from prober import hint_for  # noqa: E402  (same error-text classifier as the prober)
 
 DIAG_NS = "kuberselfheal"
-LABELS = {  # label -> problem number from the 60-problem list
-    "healthy": None, "dns_coredns_down": 14, "wrong_service_name": 12,
-    "selector_mismatch": 7, "no_ready_endpoints": 8, "port_mismatch": 9, "other": None,
-    "overlay_blocked": 4, "route_missing": 2, "mtu_blackhole": 5, "packet_loss": 28, "high_latency": 27,
+LABELS = {  # every label the agent can give
+    "healthy", "other",
+    "dns_coredns_down", "wrong_service_name", "selector_mismatch", "no_ready_endpoints", "port_mismatch",
+    "overlay_blocked", "route_missing", "mtu_blackhole", "packet_loss", "high_latency",
 }
 NEAR_MISS = 0.6  # label-value similarity for "the selector was meant to match this pod" (typo: 0.93)
 
@@ -167,7 +169,8 @@ class Diagnoser:
     def find(self, label, confidence, summary, evidence, fix, action=None):
         """Record a finding. `action` is a machine-readable fix for agent/heal.py
         (None = no safe automatic fix; a human has to decide)."""
-        self.findings.append({"label": label, "problem": LABELS[label], "confidence": confidence,
+        assert label in LABELS, label
+        self.findings.append({"label": label, "confidence": confidence,
                               "summary": summary, "evidence": evidence, "fix": fix, "action": action})
 
     def owner_deployment(self, pod):
@@ -242,7 +245,7 @@ class Diagnoser:
                              f"{pod['metadata']['name']}")
         return found
 
-    # --- set-1 checks, in path order ---
+    # --- group-1 checks, in path order ---
 
     def check_coredns(self):
         dep = self.k.get("-n", "kube-system", "get", "deploy", "coredns")
@@ -510,10 +513,10 @@ class Diagnoser:
                       + ("(no active test available)" if state is None else f"(active test inconclusive: {state})"),
                       evidence, f"set targetPort of Service {name} to {declared[0]}")
         elif state in ("refused", "timeout"):
-            # Port is right but traffic doesn't get through: not a set-1 problem.
+            # Port is right but traffic doesn't get through: not a service-path problem.
             self.other_evidence += evidence + self.policies_selecting(pod)
             self.check("ports", None, f"targetPort {tp} is the pod's declared port, but TCP is {state}: "
-                                      "traffic is blocked or dropped on the way (not a set-1 problem)")
+                                      "traffic is blocked or dropped on the way (not a service-path problem)")
         else:
             self.check("ports", True, "; ".join(evidence))
 
@@ -558,7 +561,7 @@ class Diagnoser:
 
         parsed = parse_host(host, self.ns)
         if parsed is None:
-            self.check("target", None, f"DB_HOST={host} is an IP or external name: outside set 1")
+            self.check("target", None, f"DB_HOST={host} is an IP or external name: not a Kubernetes Service")
         else:
             svc = self.check_service_exists(*parsed, host)
             if svc:
@@ -567,13 +570,13 @@ class Diagnoser:
                     ready = self.check_endpoints(svc, selected)
                     if ready:
                         self.check_ports(svc, ready, port)
-                        # Set 2: only when the Kubernetes-level path is fine.
+                        # Group 2: only when the Kubernetes service path is fine.
                         if not self.findings and self.diag_pod:
                             from network import NetworkChecks
                             try:
                                 NetworkChecks(self).run(nodes[0] if nodes else None, ready[0])
-                            except Exception as exc:  # a set-2 problem must never hide set-1 results
-                                self.check("network", None, f"set-2 checks could not run: {exc}"[:200])
+                            except Exception as exc:  # a network-check failure must never hide group-1 results
+                                self.check("network", None, f"network checks could not run: {exc}"[:200])
         return None
 
     def finish(self, start, result, error=None):
@@ -589,13 +592,13 @@ class Diagnoser:
         elif symptom and not symptom["ok"]:
             hint = symptom.get("hint")
             why = {"timeout": "timeout with a correct Service -> packets are silently dropped: "
-                              "firewall DROP (e.g. VXLAN UDP 8472), MTU or routing (set 2 found no network cause)",
+                              "firewall DROP (e.g. VXLAN UDP 8472), MTU or routing (the network checks found no cause)",
                    "refused": "refused although Service, endpoints and port are correct -> something "
                               "actively rejects the traffic: a NetworkPolicy (k3s/kube-router REJECTs "
-                              "denied packets) or a firewall REJECT rule (set 2 found no network cause)"}.get(hint)
+                              "denied packets) or a firewall REJECT rule (the network checks found no cause)"}.get(hint)
             primary = {"label": "other", "confidence": "medium",
                        "summary": "the backend cannot reach the database, and no implemented check "
-                                  "identifies the cause: the problem is outside the covered sets",
+                                  "identifies the cause: it is outside what the agent covers",
                        "evidence": [f"app error: {' '.join(symptom['error'].split())[:200]}", f"error type: {hint}"]
                                    + ([why] if why else []) + self.other_evidence,
                        "fix": None}
@@ -610,15 +613,13 @@ class Diagnoser:
                                   if not symptom else "app answers, but a check failed without a finding",
                        "evidence": [f"{c['check']}: {c['detail']}" for c in self.checks if c["ok"] is not True][:6]
                                    + self.other_evidence, "fix": None}
-        primary = {**primary, "problem": LABELS[primary["label"]]}
         return {**primary, "target": result.get("target"), "symptom": symptom,
                 "all_findings": self.findings, "checks": self.checks,
                 "elapsed_s": round(time.monotonic() - start, 2)}
 
 
 def print_report(r):
-    prob = f" (problem {r['problem']})" if r["problem"] else ""
-    print(f"\n  DIAGNOSIS: {r['label']}{prob}   confidence: {r['confidence']}")
+    print(f"\n  DIAGNOSIS: {r['label']}   confidence: {r['confidence']}")
     print(f"  {r['summary']}\n")
     s = r.get("symptom")
     print(f"  target   : backend -> {r.get('target')}")

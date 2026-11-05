@@ -1,7 +1,7 @@
 # KuberSelfHeal
 
-Diagnosing why a connection between pods on two Kubernetes nodes fails, on a
-3× Raspberry Pi k3s cluster (1 control plane + 2 workers).
+Diagnosing and self-healing failed connections between pods on two Kubernetes
+nodes, on a 3× Raspberry Pi 5 (8 GB) k3s cluster (1 control plane + 2 workers).
 
 The test app is a backend pod on one worker that reads from Postgres on the
 other worker, so every request crosses between the two nodes. It's based on
@@ -12,18 +12,18 @@ app/        Flask backend (Dockerfile, app.py)
 k8s/        app.yaml (the test app), diag.yaml (network toolbox pods on every node)
 prober/     Probes the backend continuously and records failures (JSONL)
 baseline/   collect.py records the healthy network; results/ holds the runs
-faults/     fault.sh injects / resets the faults of the current problem set
-agent/      diagnose.py: finds and labels the cause of a failed connection
-eval/       run_set1.py: injects every fault N times and scores the agent
+faults/     fault.sh injects / resets the faults the agent covers
+agent/      diagnose.py finds and labels the cause; heal.py fixes it and verifies
+eval/       run_diagnose.py / run_heal.py: inject every fault N times and score the agent
 ```
 
-**Scope.** We work through the 60 problems one *set* at a time. The agent
-labels anything outside the current set as `other`.
+**Scope.** The agent detects and heals the faults below, in two groups. Anything
+else is labelled `other` and handed to a human, never "fixed".
 
-| Set | Layer | Problems | Status |
-|---|---|---|---|
-| 1 | Service discovery & DNS | 7, 8, 9, 12, 14 | implemented |
-| 2 | Cross-node network (firewall, MTU, routing, loss, latency) | 2, 4, 5, 27, 28 | implemented |
+| Group | Layer | Faults (label) |
+|---|---|---|
+| 1 | Kubernetes service path (service discovery & DNS) | `dns_coredns_down`, `wrong_service_name`, `selector_mismatch`, `no_ready_endpoints`, `port_mismatch` |
+| 2 | Cross-node network | `overlay_blocked` (firewall), `route_missing`, `mtu_blackhole`, `packet_loss`, `high_latency` |
 
 ## 0. Cluster on a phone hotspot
 
@@ -51,7 +51,7 @@ nc -u -l 8472                          # on one Pi
 echo hello | nc -u <that-pi-ip> 8472   # on another; "hello" should appear
 ```
 
-> ⚠️ **Subnet clash (problem 6):** k3s uses `10.42.0.0/16` for pods and
+> ⚠️ **Subnet clash:** k3s uses `10.42.0.0/16` for pods and
 > `10.43.0.0/16` for Services. Some Android hotspots hand out random `10.x.x.x`
 > subnets. If yours falls inside either range, add
 > `cluster-cidr: 10.52.0.0/16` and `service-cidr: 10.53.0.0/16` to the server
@@ -190,35 +190,34 @@ pod -> pod (cross)       0.0%    5.9 ms   1.9 ms      1450   37.7 Mbit/s
 ```
 
 Expect the pod path MTU to be 50 bytes smaller than the node's. That's the VXLAN
-header, and it's the reference for the MTU fault (problem 5) later.
+header, and it's the reference for the MTU fault (`mtu_blackhole`) later.
 
 Results go to `baseline/results/<timestamp>/`: `summary.json` plus `raw/` with every
 command and its output. **Run it at least 3 times, at different times of day and with
 the phone in its usual spot.** Hotspot Wi-Fi varies, and the agent needs to know what
 "normal" noise looks like. Commit the results.
 
-## 5. Problem set 1: Service discovery & DNS
+## 5. Group 1: the Kubernetes service path (discovery & DNS)
 
 The agent follows the path the backend's connection takes, and reports the
 first broken link:
 
 ```
 DB_HOST ──DNS──► Service ──selector──► Pods ──readiness──► Endpoints ──targetPort──► Postgres
-   14 / 12              7                       8                         9
 ```
 
-| Label | Problem | How it's detected |
-|---|---|---|
-| `dns_coredns_down` | 14 | CoreDNS Deployment has 0 ready replicas, or `kube-dns` has no endpoints |
-| `wrong_service_name` | 12 | The Service named by the backend's `DB_HOST` doesn't exist (suggests similar names) |
-| `selector_mismatch` | 7 | The selector matches no pods but a pod with near-identical labels exists (a typo, e.g. `app=databse`), or it matches only the backend itself. If nothing similar exists, the database is missing: that is `other`, not a selector problem |
-| `no_ready_endpoints` | 8 | Pods match but none are Ready (with probe events), or the workload is scaled to 0 |
-| `port_mismatch` | 9 | `targetPort` is not a port the pod declares, **and** TCP to it is refused while a declared port is open |
-| `other` | – | The app fails but every check above passes, so the cause is in another layer; or the diagnosis itself could not finish (API unreachable, `kubectl` error) |
-| `healthy` | – | The app works and every check passes |
+| Label | How it's detected |
+|---|---|
+| `dns_coredns_down` | CoreDNS Deployment has 0 ready replicas, or `kube-dns` has no endpoints |
+| `wrong_service_name` | The Service named by the backend's `DB_HOST` doesn't exist (suggests similar names) |
+| `selector_mismatch` | The selector matches no pods but a pod with near-identical labels exists (a typo, e.g. `app=databse`), or it matches only the backend itself. If nothing similar exists, the database is missing: that is `other`, not a selector problem |
+| `no_ready_endpoints` | Pods match but none are Ready (with probe events), or the workload is scaled to 0 |
+| `port_mismatch` | `targetPort` is not a port the pod declares, **and** TCP to it is refused while a declared port is open |
+| `other` | Anything the agent doesn't cover: the app fails but every check (group 1 and group 2) passes; or the diagnosis itself could not finish (API unreachable, `kubectl` error) |
+| `healthy` | The app was seen answering (HTTP 200) and every check passes |
 
-Most checks compare Kubernetes objects (category A). The port check also runs
-an active TCP test (category C) from the diag pod on the backend's node.
+Most checks compare Kubernetes objects. The port check also runs an active
+TCP test from the diag pod on the backend's node.
 
 **Lesson from the first real run:** "connection refused" does *not* prove a
 wrong port. k3s's NetworkPolicy controller (kube-router) **REJECTs** denied
@@ -239,17 +238,17 @@ python3 agent/diagnose.py --json             # for scripts
 ```bash
 bash faults/fault.sh list
 bash faults/fault.sh inject port
-python3 agent/diagnose.py                    # -> port_mismatch (problem 9)
+python3 agent/diagnose.py                    # -> port_mismatch
 bash faults/fault.sh reset                   # undoes any fault
 ```
 
-`netpol` is a fault *outside* set 1. It checks that the agent says `other`
-rather than guessing a set-1 label.
+`netpol` is a fault the agent does *not* cover. It checks that the agent says
+`other` rather than guessing one of its labels.
 
 **Score the agent:**
 
 ```bash
-python3 eval/run_set1.py --rounds 3          # ~8 faults × 3 rounds, about 20–30 min
+python3 eval/run_diagnose.py --rounds 3      # group 1: ~8 faults × 3 rounds, about 20–30 min
 ```
 
 Each trial injects the fault, waits, diagnoses (and times it), resets, and waits
@@ -272,7 +271,7 @@ Baseline for the same cluster: [baseline/results/](baseline/results/).
 Node to node: 10.2 ms, MTU 1500, 14.9 Mbit/s. Pod to pod across nodes: 12.7 ms,
 MTU 1450, 13.2 Mbit/s. Pod to pod on the same node: 0.06 ms.
 
-## 6. Self-healing (set 1)
+## 6. Self-healing
 
 Kubernetes heals *drift*: it restarts a crashed pod or recreates a deleted one.
 It does **not** fix a wrong configuration. It faithfully runs 0 database replicas
@@ -291,15 +290,15 @@ diagnose ──► safe, unambiguous fix? ──no──► escalate to a human 
 
 | Fault | Fix applied automatically |
 |---|---|
-| CoreDNS scaled to 0 (14) | `scale deploy/coredns --replicas=1` |
-| wrong `DB_HOST` (12) | `set env DB_HOST=<the one similar Service that exposes the port>` |
-| selector typo (7) | patch the selector to the clearly closest pod labels (never the client's own) |
-| DB scaled to 0 (8) | scale back to the replica count last applied |
-| readiness failing after a change (8) | `rollout undo --to-revision=<previous>`, only if the current revision **never** became ready |
-| wrong `targetPort` (9) | patch it to the port the pod is actually listening on |
+| CoreDNS scaled to 0 | `scale deploy/coredns --replicas=1` |
+| wrong `DB_HOST` | `set env DB_HOST=<the one similar Service that exposes the port>` |
+| selector typo | patch the selector to the clearly closest pod labels (never the client's own) |
+| DB scaled to 0 | scale back to the replica count last applied |
+| readiness failing after a change | `rollout undo --to-revision=<previous>`, only if the current revision **never** became ready |
+| wrong `targetPort` | patch it to the port the pod is actually listening on |
 | NetworkPolicy / anything `other` | **never touched.** It may be intentional security, so it's escalated |
 
-Safety rules: act only on a `high`-confidence set-1 or set-2 diagnosis with an
+Safety rules: act only on a `high`-confidence diagnosis of a covered fault with an
 unambiguous fix; one change at a time; "fixed" means the app answers again,
 not that `kubectl` succeeded; undo the change if the fault persists; give
 young pods a grace period before rolling back. Every run is appended to
@@ -311,10 +310,19 @@ python3 agent/heal.py               # heal for real
 python3 eval/run_heal.py --rounds 3 # score it: heal success, time to recover
 ```
 
-## 7. Problem set 2: the cross-node network
+### Results on the Pi cluster, group 1 (8 scenarios × 3 rounds, random order)
 
-Set 2 looks *below* Kubernetes, at the path a packet takes between the two Pis.
-It runs only when every set-1 check passed ([agent/network.py](agent/network.py)):
+| Run | Result | Misses |
+|---|---|---|
+| [healing](eval/results/heal-20261105-023713/report.txt) | 21/24 = 87.5%: 15/18 faults healed, 3/3 `netpol` escalated untouched, 3/3 healthy runs untouched, 0 rollbacks | all 3 `readiness`: escalated instead of rolled back |
+
+The `readiness` misses led to the "never Ready since the pods started" check
+for the rollback. That fix has **not** been re-run on the cluster yet.
+
+## 7. Group 2: the cross-node network
+
+Group 2 looks *below* Kubernetes, at the path a packet takes between the two Pis.
+It runs only when every group-1 check passed ([agent/network.py](agent/network.py)):
 
 ```
 backend pod (user1) ─cni0─► flannel.1 ══ VXLAN, UDP 8472, over wlan0 (hotspot) ══► flannel.1 ─cni0─► DB pod (user2)
@@ -332,13 +340,13 @@ The key idea is to **compare layers and compare with the baseline**:
 | DF ping at 1450 bytes | passes | fails while small packets pass: MTU blackhole |
 | bulk TCP (iperf3) | ~13 Mbit/s | stalls: the MTU problem actually hurts |
 
-| Label | Problem | Injected (on the overlay only) | Detected by | Healed by |
-|---|---|---|---|---|
-| `overlay_blocked` | 4 | `iptables DROP udp/8472` on the DB node | overlay down + a DROP/REJECT rule on 8472 | deleting that rule |
-| `route_missing` | 2 | `ip route del` of the DB node's pod network on the backend node | `ip route get <db pod>` doesn't use `flannel.1` | `ip route replace … dev flannel.1 onlink` |
-| `mtu_blackhole` | 5 | drop inner packets > 1200 bytes (an MTU-limited link with no ICMP) | DF-ping path MTU 1200 < 1450, bulk TCP stalls | **TCP MSS clamping** to the measured path (1160) on both nodes |
-| `packet_loss` | 28 | `tc netem loss 40%` | pod loss ≫ baseline, underlay clean, netem rule found | removing the netem rule |
-| `high_latency` | 27 | `tc netem delay 150ms` | pod RTT ≫ baseline, underlay clean, netem rule found | removing the netem rule |
+| Label | Injected (on the overlay only) | Detected by | Healed by |
+|---|---|---|---|
+| `overlay_blocked` | `iptables DROP udp/8472` on the DB node | overlay down + a DROP/REJECT rule on 8472 | deleting that rule |
+| `route_missing` | `ip route del` of the DB node's pod network on the backend node | `ip route get <db pod>` doesn't use `flannel.1` | `ip route replace … dev flannel.1 onlink` |
+| `mtu_blackhole` | drop inner packets > 1200 bytes (an MTU-limited link with no ICMP) | DF-ping path MTU 1200 < 1450, bulk TCP stalls | **TCP MSS clamping** to the measured path (1160) on both nodes |
+| `packet_loss` | `tc netem loss 40%` | pod loss ≫ baseline, underlay clean, netem rule found | removing the netem rule |
+| `high_latency` | `tc netem delay 150ms` | pod RTT ≫ baseline, underlay clean, netem rule found | removing the netem rule |
 
 Faults are injected **only on `flannel.1` / UDP 8472, never on `wlan0`**, so SSH
 and the Kubernetes API keep working. Each one also schedules its own undo after
@@ -346,19 +354,20 @@ and the Kubernetes API keep working. Each one also schedules its own undo after
 
 ```bash
 bash faults/fault.sh inject mtu
-python3 agent/diagnose.py         # -> mtu_blackhole (problem 5)
+python3 agent/diagnose.py         # -> mtu_blackhole
 python3 agent/heal.py             # -> clamps MSS, verifies bulk TCP works again
 bash faults/fault.sh reset
-python3 eval/run_set1.py --set 2 --rounds 3   # score detection
-python3 eval/run_heal.py --set 2 --rounds 3   # score healing
+python3 eval/run_diagnose.py --group 2 --rounds 3   # score detection
+python3 eval/run_heal.py --group 2 --rounds 3       # score healing
+python3 eval/run_diagnose.py --group all --rounds 3 # both groups at once
 ```
 
 ### Results on the Pi cluster (5 faults + healthy × 3 rounds, random order)
 
 | Run | Result | Time |
 |---|---|---|
-| [detection](eval/results/set2-20261105-030339/report.txt) | **18/18 = 100%** | mean 14.1 s per diagnosis |
-| [healing](eval/results/heal-set2-20261105-031405/report.txt) | **18/18 = 100%**: 15/15 faults healed, 3/3 healthy runs untouched, 0 rollbacks | fix → app OK: mean 10.4 s (7.3 s for rule/route fixes, 23 s for the MSS clamp) |
+| [detection](eval/results/group2-20261105-030339/report.txt) | **18/18 = 100%** | mean 14.1 s per diagnosis |
+| [healing](eval/results/heal-group2-20261105-031405/report.txt) | **18/18 = 100%**: 15/15 faults healed, 3/3 healthy runs untouched, 0 rollbacks | fix → app OK: mean 10.4 s (7.3 s for rule/route fixes, 23 s for the MSS clamp) |
 
 **Findings from the real cluster:**
 - **Flannel does not restore a deleted route by itself.** It was still missing after 45 s, so this is a failure Kubernetes doesn't heal.

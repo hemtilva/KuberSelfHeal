@@ -1,5 +1,5 @@
 # Diagnostic toolbox, one copy per node. Used for the baseline now, and later by
-# the diagnosis agent for active tests (category C) and node-level checks.
+# the diagnosis agent for active tests (ping, TCP, HTTP) and node-level checks.
 #
 #   diag-host : hostNetwork + privileged, so it sees the NODE's network:
 #               wlan0, routes, iptables, conntrack, flannel.1, dmesg.

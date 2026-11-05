@@ -1,18 +1,18 @@
-"""Problem set 2: the cross-node network path, below Kubernetes.
+"""Group 2: the cross-node network path, below Kubernetes.
 
-Runs only when every set-1 check passed. Compares live measurements with the
+Runs only when every group-1 (Kubernetes service path) check passed. Compares live measurements with the
 healthy baseline (baseline/results/*/summary.json) and inspects node network
 config through the privileged diag-host pods.
 
     backend pod (node A) --cni0--> flannel.1 ==VXLAN UDP 8472 over wlan0==> flannel.1 --cni0--> DB pod (node B)
 
 Labels:
-    overlay_blocked (4)   pods can't reach each other across nodes although the nodes can,
+    overlay_blocked       pods can't reach each other across nodes although the nodes can,
                           and a firewall rule drops/rejects VXLAN (UDP 8472)
-    route_missing   (2)   a node has no route via flannel.1 to the other node's pod network
-    mtu_blackhole   (5)   full-size packets vanish on the overlay and bulk TCP stalls
-    packet_loss     (28)  pod-to-pod loss far above the baseline
-    high_latency    (27)  pod-to-pod RTT far above the baseline
+    route_missing         a node has no route via flannel.1 to the other node's pod network
+    mtu_blackhole         full-size packets vanish on the overlay and bulk TCP stalls
+    packet_loss           pod-to-pod loss far above the baseline
+    high_latency          pod-to-pod RTT far above the baseline
 
 Healing actions are "node_cmd": shell commands run on a node's host network through
 its diag-host pod, each with an exact undo command.
@@ -151,7 +151,7 @@ class NetworkChecks:
         self.check_mtu()
 
         # 4. The tunnel is fine. If the DB pod itself doesn't answer, something at the pod
-        #    blocks it (e.g. a NetworkPolicy): not a set-2 problem, so a clue for `other`.
+        #    blocks it (e.g. a NetworkPolicy): not a network problem, so a clue for `other`.
         if len(self.d.findings) == n_findings and probe != dst:
             _, out = self.in_pod(f"ping -c 3 -i 0.2 -W 1 {dst}", timeout=15)
             if parse_ping(out).get("loss_pct") == 100.0:  # a failed exec is not "no answer"

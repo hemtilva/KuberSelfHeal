@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Score self-healing on problem set 1: inject -> heal -> did the app come back on its own?
+"""Score self-healing: inject -> heal -> did the app come back on its own?
 
-    python3 eval/run_heal.py --rounds 3
+    python3 eval/run_heal.py --rounds 3              # group 1: Kubernetes service path
+    python3 eval/run_heal.py --group all --rounds 3  # both groups
     python3 eval/run_heal.py --rounds 1 --faults port,coredns
 
 Each trial: inject -> wait --settle s -> agent/heal.py (timed) -> record the outcome
@@ -9,8 +10,8 @@ Each trial: inject -> wait --settle s -> agent/heal.py (timed) -> record the out
 -> wait until healthy.
 
 Expected outcome per fault:
-    set-1/2 faults -> healed     (the agent fixed it and the app answers again)
-    netpol       -> escalated   (outside set 1 / maybe intentional: must NOT be touched)
+    covered faults -> healed     (the agent fixed it and the app answers again)
+    netpol       -> escalated   (not covered / maybe intentional: must NOT be touched)
     none         -> healthy     (nothing to do: must NOT change anything)
 
 "was_healthy_before_reset" double-checks a heal independently of the healer's own
@@ -27,16 +28,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_set1 import diagnose, fault, log, wait_healthy  # noqa: E402
+from run_diagnose import diagnose, fault, log, wait_healthy  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 EXPECTED = {"none": "healthy", "selector": "healed", "scale0": "healed", "readiness": "healed",
             "port": "healed", "wrong-name": "healed", "coredns": "healed", "netpol": "escalated",
-            # set 2: every injected network fault has a configuration cause, so all are healable
+            # group 2: every injected network fault has a configuration cause, so all are healable
             "fw-vxlan": "healed", "mtu": "healed", "route": "healed", "loss": "healed", "delay": "healed"}
-SETS = {"1": ["none", "selector", "scale0", "readiness", "port", "wrong-name", "coredns", "netpol"],
+GROUPS = {"1": ["none", "selector", "scale0", "readiness", "port", "wrong-name", "coredns", "netpol"],
         "2": ["none", "fw-vxlan", "mtu", "route", "loss", "delay"]}
-SETS["all"] = SETS["1"] + SETS["2"][1:]
+GROUPS["all"] = GROUPS["1"] + GROUPS["2"][1:]
 
 
 def heal(kubectl):
@@ -54,18 +55,19 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kubectl", default="kubectl")
     ap.add_argument("--rounds", type=int, default=3)
-    ap.add_argument("--set", default="1", choices=list(SETS))
-    ap.add_argument("--faults", default=None, help="comma-separated subset (overrides --set)")
+    ap.add_argument("--group", "--set", dest="group", default="1", choices=list(GROUPS),
+                    help="fault group: 1 = Kubernetes service path, 2 = cross-node network, all = both")
+    ap.add_argument("--faults", default=None, help="comma-separated subset (overrides --group)")
     ap.add_argument("--settle", type=float, default=20)
     ap.add_argument("--seed", type=int, default=None)
     args = ap.parse_args()
 
-    faults = [f.strip() for f in args.faults.split(",") if f.strip()] if args.faults else SETS[args.set]
+    faults = [f.strip() for f in args.faults.split(",") if f.strip()] if args.faults else GROUPS[args.group]
     if unknown := [f for f in faults if f not in EXPECTED]:
         sys.exit(f"unknown fault(s): {unknown}; choose from {list(EXPECTED)}")
     rng = random.Random(args.seed)
     env = {**os.environ, "KUBECTL": args.kubectl}
-    outdir = REPO / "eval" / "results" / ("heal-" + (f"set{args.set}-" if args.set != "1" else "")
+    outdir = REPO / "eval" / "results" / ("heal-" + (f"group{args.group}-" if args.group != "1" else "")
                                           + time.strftime("%Y%m%d-%H%M%S"))
     outdir.mkdir(parents=True)
 
