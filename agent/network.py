@@ -101,8 +101,11 @@ class NetworkChecks:
                                          "at all, even outside Kubernetes: the Wi-Fi/underlay is down")
             self.d.check("underlay", False, f"node -> node: 100% loss")
             return
-        self.d.check("underlay", True, f"node -> node: {node_ping.get('loss_pct')}% loss, "
-                                       f"{node_ping.get('rtt_avg_ms')} ms")
+        if node_ping.get("loss_pct") is None:  # no diag-host pod, or the exec failed: unknown, not "ok"
+            self.d.check("underlay", None, "node -> node ping could not run: underlay not compared")
+        else:
+            self.d.check("underlay", True, f"node -> node: {node_ping.get('loss_pct')}% loss, "
+                                           f"{node_ping.get('rtt_avg_ms')} ms")
 
         # 2. Overlay: pod to pod across the VXLAN tunnel.
         probe = self.ctx["probe"]
@@ -161,9 +164,13 @@ class NetworkChecks:
 
     def overlay_down(self):
         c = self.ctx
-        evidence = [f"node -> node works ({c['node_ping'].get('loss_pct')}% loss), "
-                    f"but pod -> pod across nodes: {c['pod_ping'].get('loss_pct')}% loss",
-                    "so the Pis can talk, but the pod tunnel (VXLAN over flannel.1) is broken"]
+        node_loss = c["node_ping"].get("loss_pct")
+        evidence = ([f"node -> node works ({node_loss}% loss), "
+                     f"but pod -> pod across nodes: {c['pod_ping'].get('loss_pct')}% loss",
+                     "so the Pis can talk, but the pod tunnel (VXLAN over flannel.1) is broken"]
+                    if node_loss is not None else
+                    [f"pod -> pod across nodes: {c['pod_ping'].get('loss_pct')}% loss "
+                     "(node -> node could not be measured, so the underlay is not ruled out)"])
 
         # a) routes: each node must send the other node's pod network into flannel.1
         client_pod_ip = (self.diag("diag-pod", c["client"]) or {}).get("status", {}).get("podIP")
@@ -219,11 +226,18 @@ class NetworkChecks:
                     f"node -> node (outside the tunnel): {c['node_ping'].get('loss_pct')}% loss, "
                     f"{c['node_ping'].get('rtt_avg_ms')} ms"]
         steps = []
+        # Only a netem rule that produces THIS symptom is the cause: a delay-only rule
+        # doesn't explain packet loss (and vice versa), so it's reported but not removed.
+        causes = "loss" if label == "packet_loss" else "delay"
         for node in (c["client"], c["server"]):
             for line in (self.on_host(node, "tc qdisc show") or "").splitlines():
                 m = re.search(r"qdisc netem \S+ dev (\S+) root .*?limit \d+\s*(.*)$", line)
                 if m:
                     dev, params = m.group(1), m.group(2).strip()
+                    if not re.search(rf"\b{causes}\b", params):
+                        evidence.append(f"on {node}: netem rule on {dev} ({params}) has no {causes}: "
+                                        "not the cause, left alone")
+                        continue
                     evidence.append(f"on {node}: traffic-control rule on {dev}: netem {params}")
                     steps.append({"node": node, "cmd": f"tc qdisc del dev {dev} root",
                                   "undo": f"tc qdisc add dev {dev} root netem {params}"})
@@ -236,7 +250,7 @@ class NetworkChecks:
             # No configuration cause: on a Wi-Fi hotspot this is physical. Report, don't touch.
             self.d.find(label, "medium", f"high {what} on the pod path, with no configuration cause found "
                                        "(likely the physical/Wi-Fi link)",
-                        evidence + ["no netem/shaping rule on either node"],
+                        evidence + [f"no netem rule with {causes} on either node"],
                         "check Wi-Fi signal and distance to the hotspot; nothing to change automatically")
 
     # --- MTU blackhole ---

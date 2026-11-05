@@ -20,7 +20,8 @@ Labels:
     packet_loss         (28) pod-to-pod loss far above the baseline
     high_latency        (27) pod-to-pod RTT far above the baseline
     other               the app fails but every set-1 and set-2 check passes
-                        (e.g. a NetworkPolicy), or the Wi-Fi itself is down
+                        (e.g. a NetworkPolicy), the Wi-Fi itself is down, or the
+                        diagnosis could not finish (API unreachable, kubectl error)
 
 Run on the control-plane Pi (standard library + kubectl):
 

@@ -135,7 +135,7 @@ class Healer:
 
     def verify(self, fault_label):
         """Wait until the app really works. Returns (status, last_result, seconds) where
-        status is 'healthy', 'changed' (a different set-1 fault is now first in line),
+        status is 'healthy', 'changed' (a different healable fault is now first in line),
         or 'timeout'. 'other' while things restart is treated as transient."""
         start = time.monotonic()
         last, changed_seen = None, 0

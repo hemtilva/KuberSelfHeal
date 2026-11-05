@@ -9,7 +9,7 @@ Each trial: inject -> wait --settle s -> agent/heal.py (timed) -> record the out
 -> wait until healthy.
 
 Expected outcome per fault:
-    set-1 faults -> healed      (the agent fixed it and the app answers again)
+    set-1/2 faults -> healed     (the agent fixed it and the app answers again)
     netpol       -> escalated   (outside set 1 / maybe intentional: must NOT be touched)
     none         -> healthy     (nothing to do: must NOT change anything)
 

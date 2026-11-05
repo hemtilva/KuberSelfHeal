@@ -214,7 +214,7 @@ DB_HOST ──DNS──► Service ──selector──► Pods ──readiness�
 | `selector_mismatch` | 7 | The selector matches 0 pods, and no workload is meant to provide them; shows the closest labels |
 | `no_ready_endpoints` | 8 | Pods match but none are Ready (with probe events), or the workload is scaled to 0 |
 | `port_mismatch` | 9 | `targetPort` is not a port the pod declares, **and** TCP to it is refused while a declared port is open |
-| `other` | – | The app fails but every check above passes, so the cause is in another layer |
+| `other` | – | The app fails but every check above passes, so the cause is in another layer; or the diagnosis itself could not finish (API unreachable, `kubectl` error) |
 | `healthy` | – | The app works and every check passes |
 
 Most checks compare Kubernetes objects (category A). The port check also runs
@@ -299,7 +299,7 @@ diagnose ──► safe, unambiguous fix? ──no──► escalate to a human 
 | wrong `targetPort` (9) | patch it to the port the pod is actually listening on |
 | NetworkPolicy / anything `other` | **never touched.** It may be intentional security, so it's escalated |
 
-Safety rules: act only on a `high`-confidence set-1 diagnosis with an
+Safety rules: act only on a `high`-confidence set-1 or set-2 diagnosis with an
 unambiguous fix; one change at a time; "fixed" means the app answers again,
 not that `kubectl` succeeded; undo the change if the fault persists; give
 young pods a grace period before rolling back. Every run is appended to
