@@ -16,6 +16,18 @@ REPO_URL = "https://github.com/hemtilva/KuberSelfHeal"
 MEMBERS = [("Hem Tilva", "24110374"), ("Vansh Barfiwala", "24110380"), ("Pratham Choksi", "24110275"),
            ("Shivangi Thaker", "24110371"), ("Jils Shah", "24110148")]
 N_MEMBERS = len(MEMBERS)
+# Appendix A: tasks and the team's agreed rating per member
+WORK = {
+    "Pratham Choksi": ("Test application (Flask backend + PostgreSQL) and its arm64 Docker image; design of the "
+                       "self-healing approach (diagnose, fix, verify, undo)", "10"),
+    "Shivangi Thaker": ("Self-healing logic and safety rules (labels, “other”, rollback); review of the "
+                        "diagnosis decisions; evaluation analysis and report", "9.5"),
+    "Hem Tilva": ("Setting up the Raspberry Pi cluster (k3s on the hotspot, networking, toolbox pods); "
+                  "running the evaluations on the cluster; repository", "8.5"),
+    "Jils Shah": ("Research on Kubernetes and overlay-network failures (DNS, Services, VXLAN, MTU); "
+                  "fault-injection scenarios and healthy baseline", "7.5"),
+    "Vansh Barfiwala": ("Background research and references; presentation slides and documentation", "6.5"),
+}
 
 doc = Document()
 st = doc.styles["Normal"]
@@ -549,8 +561,9 @@ for i in range(1, N_MEMBERS + 1):
     cell_text(t.rows[i].cells[0], str(i), align=WD_ALIGN_PARAGRAPH.CENTER, size=9)
     cell_text(t.rows[i].cells[1], MEMBERS[i - 1][0], size=9)
     cell_text(t.rows[i].cells[2], MEMBERS[i - 1][1], size=9)
-    for j in (3, 4):
-        cell_text(t.rows[i].cells[j], "", size=9)
+    tasks, rating = WORK[MEMBERS[i - 1][0]]
+    cell_text(t.rows[i].cells[3], tasks, size=9)
+    cell_text(t.rows[i].cells[4], rating, align=WD_ALIGN_PARAGRAPH.CENTER, size=9)
 for row in t.rows:
     for j, w in enumerate(W):
         row.cells[j].width = Inches(w)
