@@ -18,6 +18,7 @@ Healing actions are "node_cmd": shell commands run on a node's host network thro
 its diag-host pod, each with an exact undo command.
 """
 
+import ipaddress
 import json
 import re
 import sys
@@ -31,6 +32,24 @@ DIAG_NS = "kuberselfheal"
 DEFAULT_BASELINE = {"rtt_avg_ms": 15.0, "loss_pct": 0.0, "path_mtu": 1450, "source": "built-in defaults"}
 LOSS_MIN_PCT = 15          # pod-to-pod loss above max(this, baseline + 10) is a fault
 LATENCY_EXTRA_MS = 50      # RTT above baseline + this (and > 2x baseline) is a fault
+POD_PATH_DEVS = ("flannel.1", "cni0")   # traffic-control rules here shape pod traffic only
+
+
+def hits_nodes(rule, node_ips):
+    """False if an iptables rule is limited by -s/-d to addresses that are none of our nodes."""
+    for opt in ("-s", "-d"):
+        m = re.search(rf"(?:^|\s)(! )?{opt} (\S+)", rule)
+        if not m:
+            continue
+        if m.group(1):
+            return True  # negated ("everything except ..."): treat as affecting us
+        try:
+            net = ipaddress.ip_network(m.group(2), strict=False)
+        except ValueError:
+            return True  # can't tell: treat as affecting us
+        if not any(ipaddress.ip_address(ip) in net for ip in node_ips):
+            return False
+    return True
 
 
 def load_baseline():
@@ -202,14 +221,21 @@ class NetworkChecks:
 
         # b) firewall: anything dropping/rejecting VXLAN (UDP 8472) on either node?
         steps, found = [], []
+        node_ips = [c["nodes"][n]["ip"] for n in (c["client"], c["server"]) if c["nodes"][n].get("ip")]
         for node in (c["client"], c["server"]):
             for line in (self.on_host(node, "iptables -S") or "").splitlines():
                 # exactly UDP port 8472 (not 18472, not an address containing it)
-                if (line.startswith("-A ") and re.search(r"-p udp\b", line)
+                if not (line.startswith("-A ") and re.search(r"-p udp\b", line)
                         and re.search(r"--dports? (\S+,)?8472\b", line) and re.search(r"-j (DROP|REJECT)\b", line)):
-                    found.append(f"on {node}: {line}")
-                    steps.append({"node": node, "cmd": "iptables " + line.replace("-A ", "-D ", 1),
-                                  "undo": "iptables " + line.replace("-A ", "-I ", 1)})
+                    continue
+                # A rule limited to other addresses (-s/-d) does not touch our tunnel and may be
+                # deliberate security: report it, never delete it.
+                if not hits_nodes(line, node_ips):
+                    found.append(f"on {node}: {line}  (limited to other addresses: not the cause, left alone)")
+                    continue
+                found.append(f"on {node}: {line}")
+                steps.append({"node": node, "cmd": "iptables " + line.replace("-A ", "-D ", 1),
+                              "undo": "iptables " + line.replace("-A ", "-I ", 1)})
         if steps:
             self.d.find("overlay_blocked", "high",
                         "a firewall rule drops the VXLAN tunnel (UDP 8472) between the nodes",
@@ -244,6 +270,12 @@ class NetworkChecks:
                 if not re.search(rf"\b{causes}\b", params):
                     evidence.append(f"on {node}: netem rule on {dev} ({params}) has no {causes}: "
                                     "not the cause, left alone")
+                    continue
+                if dev not in POD_PATH_DEVS:
+                    # e.g. on wlan0: it shapes the node's whole link, not just pod traffic, and
+                    # may be deliberate. Report it; a human decides.
+                    evidence.append(f"on {node}: netem rule on {dev} ({params}) is outside the pod path "
+                                    f"({', '.join(POD_PATH_DEVS)}): not removed automatically")
                     continue
                 evidence.append(f"on {node}: traffic-control rule on {dev}: netem {params}")
                 steps.append({"node": node, "cmd": f"tc qdisc del dev {dev} root",

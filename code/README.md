@@ -295,15 +295,15 @@ diagnose ──► safe, unambiguous fix? ──no──► escalate to a human 
 |---|---|
 | CoreDNS scaled to 0 | `scale deploy/coredns --replicas=1` |
 | wrong `DB_HOST` | `set env DB_HOST=<the one similar Service that exposes the port>` |
-| selector typo | patch the selector to the clearly closest pod labels (never the client's own) |
+| selector typo | patch the selector to the closest pod labels, only if it is a clear winner, at most 2 characters off (a typo, not `database-old`), serves the Service's port, and is never the backend |
 | DB scaled to 0 | scale back to the replica count last applied |
 | readiness failing after a change | `rollout undo --to-revision=<previous>`, only if the current revision **never** became ready |
-| wrong `targetPort` | patch it to the port the pod is actually listening on |
+| wrong `targetPort` | patch it to the port seen open that is clearly the database's (same number or name as the Service port, or the only open one); otherwise escalate |
 | NetworkPolicy / anything `other` | **never touched.** It may be intentional security, so it's escalated |
 
 Safety rules: act only on a `high`-confidence diagnosis of a covered fault with an
 unambiguous fix; one change at a time; "fixed" means the app answers again,
-not that `kubectl` succeeded; undo the change if the fault persists; give
+not that `kubectl` succeeded; undo the change if the app does not answer again, whatever the new diagnosis (so the cluster ends up working or as it was); give
 young pods a grace period before rolling back. Every run is appended to
 `heal_log.jsonl`.
 
@@ -345,11 +345,11 @@ The key idea is to **compare layers and compare with the baseline**:
 
 | Label | Injected (on the overlay only) | Detected by | Healed by |
 |---|---|---|---|
-| `overlay_blocked` | `iptables DROP udp/8472` on the DB node | overlay down + a DROP/REJECT rule on 8472 | deleting that rule |
+| `overlay_blocked` | `iptables DROP udp/8472` on the DB node | overlay down + a DROP/REJECT rule on 8472 that applies to the nodes (not one limited to other addresses) | deleting that rule |
 | `route_missing` | `ip route del` of the DB node's pod network on the backend node | `ip route get <db pod>` doesn't use `flannel.1` | `ip route replace … dev flannel.1 onlink` |
 | `mtu_blackhole` | drop inner packets > 1200 bytes (an MTU-limited link with no ICMP) | DF-ping path MTU 1200 < 1450, bulk TCP stalls | **TCP MSS clamping** to the measured path (1160) on both nodes |
-| `packet_loss` | `tc netem loss 40%` | pod loss ≫ baseline, underlay clean, netem rule found | removing the netem rule |
-| `high_latency` | `tc netem delay 150ms` | pod RTT ≫ baseline, underlay clean, netem rule found | removing the netem rule |
+| `packet_loss` | `tc netem loss 40%` | pod loss ≫ baseline, underlay clean, netem loss rule on `flannel.1`/`cni0` | removing the netem rule (one on `wlan0` is only reported) |
+| `high_latency` | `tc netem delay 150ms` | pod RTT ≫ baseline, underlay clean, netem delay rule on `flannel.1`/`cni0` | removing the netem rule (one on `wlan0` is only reported) |
 
 Faults are injected **only on `flannel.1` / UDP 8472, never on `wlan0`**, so SSH
 and the Kubernetes API keep working. Each one also schedules its own undo after

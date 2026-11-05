@@ -11,7 +11,9 @@ Safety rules:
   * never touches "other" (e.g. a NetworkPolicy may be intentional security)
   * one change at a time, each verified: "fixed" means the app really answers
     again (HTTP 200 through the backend), not just that kubectl succeeded
-  * if the fault is still there after --verify-timeout, the change is undone
+  * if the app does not answer after --verify-timeout, the change is undone, whatever
+    the diagnosis says now: the cluster ends up working or as we found it (a fix that
+    removed a faulty rule/route/qdisc is kept: undoing it would re-create the fault)
   * young not-ready pods get a grace period (they may simply still be starting)
   * every step is appended to heal_log.jsonl (audit trail)
 
@@ -233,20 +235,27 @@ class Healer:
                         after=after["label"] if after else None)
             self.say(f"verify: {status} after {secs} s (now: {step['after']})")
 
-            if status == "timeout" and after and after["label"] == label:
+            if status == "timeout":
+                # The app does not answer after the fix. Whatever the diagnosis says now (the same
+                # fault, `other`, or nothing usable), the change did not help, and it may have made
+                # things worse (e.g. pointed the Service at the wrong port): undo it, so the cluster
+                # is left either working or exactly as we found it. Only a fix that removed a faulty
+                # rule/route/qdisc is kept, because undoing it would re-create a fault.
+                now = after["label"] if after else "unknown"
                 undo = inverse(action)
                 if undo:
-                    self.say("the fault is still there: undoing the change")
+                    self.say(f"the app still does not answer (now: {now}): undoing the change")
                     step["rolled_back"] = self.apply(undo)
                 elif action["type"] == "node_cmd":
                     step["kept"] = "fix kept: it removed a faulty rule/route, so undoing it would re-create the fault"
-                report.update(outcome="failed", reason=f"{label} persisted {secs} s after the fix",
-                              diagnosis=summary(after))
-                break
-            if status == "timeout":
-                report.update(outcome="escalated", reason=f"fixed {label}, but the app still fails: "
-                              f"{after['label'] if after else 'unknown'}",
-                              diagnosis=summary(after) if after else None)
+                done = "change undone" if undo else "change kept" if step.get("kept") else "nothing to undo"
+                if now == label:
+                    report.update(outcome="failed", reason=f"{label} persisted {secs} s after the fix ({done})",
+                                  diagnosis=summary(after))
+                else:
+                    report.update(outcome="escalated",
+                                  reason=f"the fix for {label} did not bring the app back (now: {now}; {done})",
+                                  diagnosis=summary(after) if after else None)
                 break
             # 'healthy' or 'changed' -> loop: the next diagnosis decides
 

@@ -57,7 +57,8 @@ LABELS = {  # every label the agent can give
     "dns_coredns_down", "wrong_service_name", "selector_mismatch", "no_ready_endpoints", "port_mismatch",
     "overlay_blocked", "route_missing", "mtu_blackhole", "packet_loss", "high_latency",
 }
-NEAR_MISS = 0.6  # label-value similarity for "the selector was meant to match this pod" (typo: 0.93)
+NEAR_MISS = 0.6     # label similarity for "the selector was meant to match this pod" (typo: 0.93)
+MAX_TYPO_EDITS = 2  # the selector is fixed automatically only if it is this close (a typo)
 
 
 class Kube:
@@ -125,14 +126,26 @@ def near_miss(selector, labels):
     from the fix. A pod is NOT a near miss if a pair has the same key but a dissimilar value
     (app=database vs app=backend: 0.40) - that pod is something else - or if nothing matched."""
     sim = lambda a, b: difflib.SequenceMatcher(None, a, b).ratio()
-    score, fixed = 0.0, {}
+    score, fixed, edits = 0.0, {}, 0
     for k, v in selector.items():
         best = max(((min(sim(k, k2), sim(v, v2)), k2, v2) for k2, v2 in labels.items()), default=None)
         if best and best[0] >= NEAR_MISS:
             score, fixed[best[1]] = score + best[0], best[2]
+            edits += edit_distance(k, best[1]) + edit_distance(v, best[2])
         elif k in labels:
             return None  # same key, different thing
-    return (score, fixed) if fixed else None
+    return (score, fixed, edits) if fixed else None
+
+
+def edit_distance(a, b):
+    """Levenshtein distance: how many single-character edits turn a into b."""
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
 
 
 def parse_host(host, default_ns):
@@ -158,6 +171,7 @@ class Diagnoser:
         self.diag_pod = None
         self.findings, self.checks = [], []
         self.client_labels = {}   # pod labels of the client (never point a Service at it)
+        self.client_pod_labels = []  # filled in check_selector: template + live pod labels of the client
         self.client_port = None
         self.other_evidence = []  # clues for the "other" label (e.g. NetworkPolicies on the DB pod)
 
@@ -320,12 +334,18 @@ class Diagnoser:
         selected = [p for p in pods if matches(selector, p["metadata"].get("labels", {}))]
         sel_txt = ",".join(f"{k}={v}" for k, v in selector.items())
         is_client = lambda p: bool(self.client_labels) and matches(self.client_labels, p["metadata"].get("labels", {}))
-        if selected and all(is_client(p) for p in selected) and name != self.client_service:
-            # The DB Service selects the backend itself. Without this, the port check would
-            # see "5432 refused, 5000 open" on the backend pod and call it port_mismatch.
+        # Labels a corrected selector must never match: the backend's template and its live pods.
+        self.client_pod_labels = [self.client_labels] + [p["metadata"].get("labels", {}) for p in pods if is_client(p)]
+        if any(is_client(p) for p in selected) and name != self.client_service:
+            # The DB Service selects the backend (alone or together with the DB pods). Without
+            # this, the port check could test the backend pod, see "5432 refused, 5000 open"
+            # and "fix" the DB Service's targetPort to the backend's HTTP port.
+            both = not all(is_client(p) for p in selected)
             return self.selector_mismatch(svc, selector, sel_txt, [p for p in pods if not is_client(p)],
-                                          f"Service {name} selector {sel_txt} matches only the client "
-                                          f"({self.client_deploy}) itself, not the database", wrong_target=True)
+                                          f"Service {name} selector {sel_txt} matches the client "
+                                          f"({self.client_deploy}) " + ("as well as other pods: traffic is "
+                                          "split between the backend and the database" if both else
+                                          "itself, not the database"), wrong_target=True)
         if selected:
             self.check("selector", True, f"selector {sel_txt} matches {len(selected)} pod(s)")
             return selected
@@ -365,25 +385,38 @@ class Diagnoser:
         means the database itself is missing, which is not a selector problem: evidence for `other`.
         A selector that matches the wrong pods (wrong_target) is a mismatch either way."""
         ns, name = svc["metadata"]["namespace"], svc["metadata"]["name"]
-        near = {}  # label set -> (score, a pod with it); replicas of one workload count once
+        near = {}  # label set -> (score, pod name, labels, edits, pod); replicas of one workload count once
         for p in candidates:
             m = near_miss(selector, p["metadata"].get("labels", {}))
-            if m:
-                near.setdefault(json.dumps(m[1], sort_keys=True), (m[0], p["metadata"]["name"], m[1]))
+            # A corrected selector that still picks the backend, or changes nothing, is no correction.
+            if m and m[1] != selector and not any(matches(m[1], cl) for cl in self.client_pod_labels):
+                near.setdefault(json.dumps(m[1], sort_keys=True),
+                                (m[0], p["metadata"]["name"], m[1], m[2], p))
         near = sorted(near.values(), key=lambda n: -n[0])
         if not near and not wrong_target:
             self.other_evidence += [headline, "no pod has labels similar to the selector, and no workload's "
                                     "template matches it: the database workload itself seems to be missing"]
             self.check("selector", False, f"{headline}; nothing similar exists (not a selector typo)")
             return None
-        evidence = [headline] + [f"pod {pname} has {','.join(f'{k}={v}' for k, v in labels.items())}"
-                                 for _, pname, labels in near[:3]]
-        # Auto-fix only with a clear winner: one label set that beats every other.
+        evidence = [headline] + [f"pod {n[1]} has {','.join(f'{k}={v}' for k, v in n[2].items())}"
+                                 for n in near[:3]]
+        # Auto-fix only when all of these hold:
+        #  - a clear winner: one label set that beats every other;
+        #  - a typo, not a different name: at most MAX_TYPO_EDITS character edits
+        #    (app=databse -> app=database is 1; app=database -> app=database-old is 4);
+        #  - the winner really serves the Service's port (it is a database, not just similarly named).
         clear = len(near) == 1 or (len(near) > 1 and near[0][0] > near[1][0])
         if not near:
             evidence.append("no pod has labels similar to the selector: not fixing automatically")
         elif not clear:
             evidence.append("several pods are equally close: not fixing automatically")
+        elif near[0][3] > MAX_TYPO_EDITS:
+            evidence.append(f"the closest labels differ by {near[0][3]} characters: more than a typo "
+                            "(maybe a different workload), not fixing automatically")
+            clear = False
+        elif not self.serves_service_port(svc, near[0][4]):
+            evidence.append(f"pod {near[0][1]} does not serve the Service's target port: not fixing automatically")
+            clear = False
         self.find("selector_mismatch", "high", f"Service {name}'s selector doesn't match the database pods",
                   evidence, f"kubectl -n {ns} patch svc {name} --type=merge -p "
                             f"'{json.dumps({'spec': {'selector': near[0][2]}})}'" if near
@@ -391,6 +424,22 @@ class Diagnoser:
                   {"type": "patch_selector", "ns": ns, "svc": name, "selector": near[0][2],
                    "previous": selector} if clear else None)
         return None
+
+    def serves_service_port(self, svc, pod):
+        """True if `pod` declares the Service's target port, or answers on it (TCP open)."""
+        ports = svc["spec"].get("ports", [])
+        sp = next((p for p in ports if p["port"] == self.client_port), ports[0] if ports else None)
+        if sp is None:
+            return False
+        tp = sp.get("targetPort", sp["port"])
+        cports = [(cp.get("name"), cp["containerPort"]) for c in pod["spec"]["containers"]
+                  for cp in c.get("ports", [])]
+        if isinstance(tp, str):
+            return any(nm == tp for nm, _ in cports)
+        if tp in [n for _, n in cports]:
+            return True
+        ip = pod.get("status", {}).get("podIP")
+        return bool(ip) and self.tcp(ip, tp) == "open"
 
     def check_endpoints(self, svc, selected):
         """Return the Ready pods behind the Service, or None to stop."""
@@ -465,7 +514,7 @@ class Diagnoser:
                        f"Service {name} ports: {', '.join(str(p['port']) for p in ports)}"],
                       f"set DB_PORT to {ports[0]['port']} or add port {client_port} to Service {name}")
             return
-        tp = sp.get("targetPort", sp["port"])
+        tp = original_tp = sp.get("targetPort", sp["port"])
         pod = ready_pods[0]
         pod_ip, pod_name = pod["status"]["podIP"], pod["metadata"]["name"]
         cports = [(cp.get("name"), cp["containerPort"])
@@ -499,14 +548,24 @@ class Diagnoser:
         wrong_port = bool(open_alts) or bool(declared and tp not in declared)
 
         if state == "refused" and wrong_port:
-            fix_port = open_alts[0] if open_alts else declared[0]
+            # Fix only to a port that was seen OPEN and is unambiguously the database's:
+            # the open port with the Service port's number or name, else the only open one.
+            # (A pod may also expose e.g. a metrics port; never guess between them, and never
+            # pick a declared port that did not answer.)
+            by_name = [n for nm, n in cports if n in open_alts and nm and nm == sp.get("name")]
+            fix_port = (sp["port"] if sp["port"] in open_alts else by_name[0] if by_name
+                        else open_alts[0] if len(open_alts) == 1 else None)
+            if fix_port is None:
+                evidence.append("no single open port is clearly the database's: not fixing automatically"
+                                if open_alts else "no other declared port answers: not fixing automatically")
             self.find("port_mismatch", "high",
                       f"Service {name} forwards to port {tp}, but nothing listens there on the pod",
-                      evidence, f"kubectl -n {ns} patch svc {name} --type=json -p '"
-                                + json.dumps([{"op": "replace", "path": f"/spec/ports/{ports.index(sp)}/targetPort",
-                                               "value": fix_port}]) + "'",
+                      evidence, (f"kubectl -n {ns} patch svc {name} --type=json -p '"
+                                 + json.dumps([{"op": "replace", "path": f"/spec/ports/{ports.index(sp)}/targetPort",
+                                                "value": fix_port}]) + "'") if fix_port
+                      else f"set targetPort of Service {name} to the port Postgres listens on",
                       {"type": "patch_target_port", "ns": ns, "svc": name, "index": ports.index(sp),
-                       "value": fix_port, "previous": tp})
+                       "value": fix_port, "previous": original_tp} if fix_port else None)
         elif state != "open" and wrong_port:
             self.find("port_mismatch", "medium",
                       f"Service {name} targetPort {tp} is not a port the pod declares "

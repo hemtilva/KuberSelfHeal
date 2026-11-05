@@ -480,7 +480,7 @@ para("Kubernetes-level fixes bring the application back in 2–8 s on average; t
      "run is the diagnosis before the fix (19–37 s).")
 para("**Validity.** The faults are injected by us, so their signatures (one rule, one route, one qdisc) are "
      "clean; real faults may be messier. The results predate the last code changes (stricter labels, errors "
-     "→ `other`, the readiness rollback rule). These were checked in a simulated cluster (24/24 scenarios) "
+     "→ `other`, the readiness rollback rule, safer undo and fix choice). These were checked in a simulated cluster (34/34 scenarios) "
      "but not yet re-run on the Pis.")
 
 # ---------- IX. Summary ----------
