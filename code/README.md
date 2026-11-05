@@ -17,7 +17,8 @@ prober/     Probes the backend continuously and records failures (JSONL)
 baseline/   collect.py records the healthy network; results/ holds the runs
 faults/     fault.sh injects / resets the faults the agent covers
 agent/      diagnose.py finds and labels the cause; heal.py fixes it and verifies
-eval/       run_diagnose.py / run_heal.py: inject every fault N times and score the agent
+agent/reroute.py  moves the backend to a node with a working path to the DB (section 8)
+eval/       run_diagnose.py / run_heal.py / run_reroute.py: inject every fault N times and score the agent
 ```
 
 **Scope.** The agent detects and heals the faults below, in two groups. Anything
@@ -112,8 +113,14 @@ kubectl apply -f k8s/app.yaml
 kubectl get pods -o wide
 ```
 
-The image is loaded only into the backend Pi's container runtime, so the
-backend pod has to run there. Its `nodeSelector` makes sure it does.
+The backend *prefers* the `role=backend` Pi (node affinity), so normally every
+request crosses nodes. It may move to the DB Pi when `agent/reroute.py` finds the
+backend Pi's path to the DB broken (section 8), so **import the image on both workers**:
+
+```bash
+# on the backend Pi, after docker build:
+docker save backend-api:latest | ssh <user>@<db-pi> sudo k3s ctr images import -
+```
 
 ## 2. Check it works
 
@@ -380,6 +387,94 @@ python3 eval/run_diagnose.py --group all --rounds 3 # both groups at once
   - a fix that *removed* a fault (a rule, a qdisc, a route) is never rolled back, because that would re-create the fault;
   - loss and latency are confirmed with a second sample, so a momentary hotspot stall isn't a false alarm;
   - loss or latency with **no** configuration cause is reported as the physical link and never "fixed".
+
+## 8. Path-aware rescheduling (`agent/reroute.py`)
+
+Sections 5–7 find the **cause** and repair it. This agent does something simpler and
+cause-agnostic: it keeps the backend on a node that **can really reach the database**.
+
+**The gap it closes.** Kubernetes places pods by CPU, memory, labels and taints; it never
+checks whether the network path a pod needs works. When the backend Pi stays `Ready` but
+its path to the DB breaks, the liveness probe restarts the backend **on the same node**
+(still broken), and a readiness probe would only remove it from the Service. Nothing
+moves it. The node stays `Ready` because the kubelet talks to the API server over `wlan0`,
+not over the VXLAN overlay.
+
+### The rules (all fixed numbers, no learning, no guessing)
+
+| # | Rule | Why | Borrowed from |
+|---|---|---|---|
+| 1 | Every 5 s the diag-pod on **every node** does what the backend does: DNS lookup of `db-service` (must return its ClusterIP), TCP connect to `ClusterIP:5432`, 10 pings to the DB pod (loss ≥ 30% or RTT > 100 ms fails), 3 DF pings of 1400 bytes (MTU) | Test the real path, not a stand-in, so *any* cause that breaks it is caught | Goldpinger, Pingmesh |
+| 2 | A node is **BAD** after 3 failed rounds in a row (~15 s), **GOOD** again after 12 passed rounds (~60 s). If a probe can't run, the round is *unknown* and changes nothing | Hotspot Wi-Fi drops single probes; asymmetric thresholds because moving back too early costs an outage, staying too long costs only balance (hysteresis) | k8s probe `failureThreshold`/`successThreshold`, RFC 2439 |
+| 3 | A node that went BAD 3 times in 10 min is **flapping** and needs 120 clean rounds (~10 min) | Don't move pods back and forth on a flaky link | RFC 2439 route flap damping |
+| 4 | **No action** if no node is GOOD, if the DB pod isn't Running+Ready, or if no GOOD node is allowed to run the backend | Can't localize or there is nowhere better to go; the problem may be the probes themselves | medik8s Node Health Check `minHealthy` |
+| 5 | Taint BAD nodes `kuberselfheal.io/no-db-path=true:NoSchedule`, then delete **one** backend pod on a BAD node per round; max one eviction per node per 2 min | The Deployment recreates the pod; the taint stops the scheduler putting it back on the broken node | Draino, descheduler `RemovePodsViolatingNodeTaints` |
+| 6 | Within 60 s the backend must be Ready on a GOOD node **and** the app must answer HTTP 200. Otherwise alert and stop evicting until every node is GOOD | Worst case is "a human is called", never a loop of actions | medik8s escalation |
+| 7 | When a node is GOOD again its taint is removed; when no node is BAD, `rollout restart` the backend once so it returns to its preferred node | Kubernetes never rebalances by itself | medik8s removes remediation when healthy |
+
+The log also says *where* the fault probably is (only the backend node fails → that node's
+side; every node except the DB's fails → the DB node's side). Actions never depend on that
+guess. With 3 nodes "node X is broken" and "both of X's links are broken" look the same,
+and both lead to the same action.
+
+Moving next to the DB never lowers availability: on the DB's node the backend needs
+`A(DB node)`; elsewhere it needs `A(node) × A(link) × A(DB node)`, which is never larger.
+The DB is already a single point of failure, so co-location adds no new way to fail.
+
+### Setup (once)
+
+```bash
+kubectl apply -f k8s/app.yaml       # backend now PREFERS role=backend instead of requiring it,
+                                    # never the control plane; DB tolerates the reroute taint
+kubectl apply -f k8s/diag.yaml      # diag pods tolerate every taint, so probing continues
+# the backend image must be on BOTH workers (section 1)
+```
+
+### Run and test it
+
+```bash
+python3 eval/test_reroute_logic.py   # offline test of the rules with a fake cluster (no Pis)
+python3 agent/reroute.py --once      # one probe round from every node: all should be "pass"
+python3 agent/reroute.py --dry-run -v   # full loop, prints the table, changes nothing
+python3 agent/reroute.py             # live (add --kubectl "sudo k3s kubectl" if needed)
+```
+
+By hand, in a second terminal (point clients at the **DB node's** IP, see the limits below):
+
+```bash
+python3 prober/prober.py --url http://<db-pi-ip>:30080/ --out probes.jsonl   # third terminal
+bash faults/fault.sh inject route    # backend Pi loses its route to the DB Pi's pods
+kubectl get pods -o wide -w          # backend should move to the DB Pi within ~30-40 s
+bash faults/fault.sh reset           # ~60 s later: taint removed, backend moves back
+```
+
+Scored, with the agent running, then again with it stopped (the "Kubernetes alone" baseline):
+
+```bash
+python3 eval/run_reroute.py --url http://<db-pi-ip>:30080/ --rounds 3
+python3 eval/run_reroute.py --url http://<db-pi-ip>:30080/ --rounds 3 --label no-agent
+```
+
+What we **expect**, to be confirmed on the cluster:
+
+| Fault | Expected | Reason |
+|---|---|---|
+| `route` (backend Pi) | rerouted | only the backend Pi fails; the DB Pi is fine |
+| `mtu`, `delay` (DB Pi's `flannel.1`) | rerouted | the other nodes fail; the DB Pi reaches its own DB without the overlay |
+| `loss` (DB Pi) | rerouted, maybe slower | 40% loss fails the ≥30% rule in most rounds |
+| `fw-vxlan` (DB Pi) | **escalated** | CoreDNS runs on the master, so the DB Pi's DNS replies arrive over the blocked VXLAN too: no node passes, so the agent correctly does nothing |
+| `none` | no action | false-alarm check |
+
+### Limits (say these in the report)
+
+- **It doesn't repair the cause.** It keeps the app working and reports the bad path;
+  `diagnose.py` / `heal.py` explain and repair the cause.
+- **DB node down, or the whole Wi-Fi down:** every node fails → alert only.
+- **Clients must use the DB node's IP.** With NodePort, a request entering a node whose
+  path to the backend is broken still fails (`externalTrafficPolicy: Local` is the general fix).
+- **The 30% / 100 ms / 3-round numbers are chosen, not proven.** Wi-Fi losses are bursty,
+  so the false-alarm rate must be measured (`none` trials, and a long run with no faults).
+- **Don't run `heal.py` and `reroute.py` at the same time.** Both act on the cluster.
 
 ## Design notes
 

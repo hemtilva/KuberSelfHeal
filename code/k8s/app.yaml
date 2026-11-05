@@ -1,5 +1,6 @@
 # Two-pod test app: Postgres on one worker Pi, Flask backend on the other,
 # so every request to the backend crosses between the two workers.
+# (The backend may move to the DB's worker when agent/reroute.py finds its path broken.)
 #
 # Before applying, label the two worker Pis:
 #   kubectl label node <db-pi-name>      role=database
@@ -45,6 +46,12 @@ spec:
     spec:
       nodeSelector:
         role: database
+      # agent/reroute.py taints nodes whose path to the DB is broken. The DB itself
+      # must still be able to (re)start on its node, so it tolerates that taint.
+      tolerations:
+        - key: kuberselfheal.io/no-db-path
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: postgres
           image: postgres:15-alpine
@@ -107,8 +114,24 @@ spec:
       labels:
         app: backend
     spec:
-      nodeSelector:
-        role: backend
+      # Normally on the role=backend worker, so every request crosses nodes. This is a
+      # PREFERENCE, not a rule, so agent/reroute.py can move the backend to the other
+      # worker (next to the DB) when the backend Pi's path to the DB breaks. Never on the
+      # control plane. The image must be imported on BOTH workers (README section 8).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - key: role
+                    operator: In
+                    values: [backend]
       containers:
         - name: backend
           image: backend-api:latest
